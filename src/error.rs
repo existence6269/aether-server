@@ -23,6 +23,8 @@ pub enum ServerError {
     InvalidAcknowledgement,
     #[error("server is shutting down")]
     ShuttingDown,
+    #[error("account directory is not configured")]
+    Unavailable,
     #[error("internal server error")]
     Internal,
 }
@@ -38,6 +40,7 @@ impl ServerError {
             Self::ResourceLimit => "resource_limit",
             Self::InvalidAcknowledgement => "invalid_acknowledgement",
             Self::ShuttingDown => "shutting_down",
+            Self::Unavailable => "unavailable",
             Self::Internal => "internal",
         }
     }
@@ -50,6 +53,7 @@ impl ServerError {
             Self::MessageTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::QueueFull | Self::ResourceLimit => StatusCode::TOO_MANY_REQUESTS,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }

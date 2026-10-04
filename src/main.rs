@@ -13,8 +13,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .compact()
         .try_init()?;
 
-    let authorizer = StaticDeviceAuthorizer::from_env()?;
-    if std::env::var_os("AETHER_AUTHORIZED_DEVICES").is_none() {
+    let using_directory = std::env::var_os("DATABASE_URL").is_some();
+    let authorizer = if using_directory {
+        StaticDeviceAuthorizer::new()
+    } else {
+        StaticDeviceAuthorizer::from_env()?
+    };
+    if !using_directory && std::env::var_os("AETHER_AUTHORIZED_DEVICES").is_none() {
         tracing::warn!("no device allowlist is configured; WebSocket clients are rejected");
     }
     run_from_env(Arc::new(authorizer)).await

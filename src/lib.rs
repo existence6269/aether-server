@@ -1,3 +1,4 @@
+mod accounts;
 mod auth;
 mod config;
 mod error;
@@ -43,7 +44,10 @@ pub async fn run_from_env(
     let config = ServerConfig::from_env()?;
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(bind_addr = %config.bind_addr, "Aether relay listening");
-    let state = AppState::new(config, authorizer)?;
+    let state = match accounts::AccountDirectory::connect_from_env(&config.server_id).await? {
+        Some(directory) => AppState::with_account_directory(config, directory)?,
+        None => AppState::new(config, authorizer)?,
+    };
     serve(listener, state, shutdown_signal()).await?;
     Ok(())
 }

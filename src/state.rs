@@ -12,7 +12,8 @@ use tokio::sync::{mpsc, watch, Mutex};
 use uuid::Uuid;
 
 use crate::{
-    DeviceAddress, DeviceAuthorizer, OpaqueEnvelope, ServerConfig, ServerError, ServerFrame,
+    accounts::AccountDirectory, DeviceAddress, DeviceAuthorizer, OpaqueEnvelope, ServerConfig,
+    ServerError, ServerFrame,
 };
 
 const AUTH_CHALLENGE_REPLAY_RETENTION: Duration = Duration::from_secs(10 * 60);
@@ -26,6 +27,7 @@ pub struct AppState {
 struct Inner {
     config: ServerConfig,
     authorizer: Arc<dyn DeviceAuthorizer>,
+    accounts: Option<AccountDirectory>,
     hub: Mutex<Hub>,
     used_auth_challenges: Mutex<HashMap<[u8; 16], Instant>>,
     next_connection_id: AtomicU64,
@@ -69,12 +71,28 @@ impl AppState {
         config: ServerConfig,
         authorizer: Arc<dyn DeviceAuthorizer>,
     ) -> Result<Self, ServerError> {
+        Self::build(config, authorizer, None)
+    }
+
+    pub(crate) fn with_account_directory(
+        config: ServerConfig,
+        directory: AccountDirectory,
+    ) -> Result<Self, ServerError> {
+        Self::build(config, Arc::new(directory.clone()), Some(directory))
+    }
+
+    fn build(
+        config: ServerConfig,
+        authorizer: Arc<dyn DeviceAuthorizer>,
+        accounts: Option<AccountDirectory>,
+    ) -> Result<Self, ServerError> {
         config.validate()?;
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 authorizer,
+                accounts,
                 hub: Mutex::new(Hub::default()),
                 used_auth_challenges: Mutex::new(HashMap::new()),
                 next_connection_id: AtomicU64::new(1),
@@ -82,6 +100,10 @@ impl AppState {
                 shutdown,
             }),
         })
+    }
+
+    pub(crate) fn accounts(&self) -> Option<&AccountDirectory> {
+        self.inner.accounts.as_ref()
     }
 
     pub fn config(&self) -> &ServerConfig {
@@ -116,6 +138,24 @@ impl AppState {
     pub async fn authorize_recipient(&self, device: &DeviceAddress) -> Result<(), ServerError> {
         device.validate()?;
         self.inner.authorizer.authorize_recipient(device).await
+    }
+
+    pub(crate) async fn revoke_route_device(&self, address: &DeviceAddress) {
+        let sender = {
+            let mut hub = self.inner.hub.lock().await;
+            let sender = hub
+                .connections
+                .remove(address)
+                .map(|connection| connection.sender);
+            if let Some(mailbox) = hub.mailboxes.remove(address) {
+                hub.queued_messages -= mailbox.messages.len();
+                hub.queued_bytes -= mailbox.bytes;
+            }
+            sender
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(OutboundFrame::Close).await;
+        }
     }
 
     pub(crate) async fn consume_auth_challenge(
@@ -726,6 +766,32 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn device_revocation_closes_its_relay_and_discards_queued_messages() {
+        let state = state_with_limits(4, 8, 8);
+        let address = DeviceAddress::new("alice", "phone").unwrap();
+        let mut connection = state.connect(address.clone()).await.unwrap();
+        state
+            .enqueue(
+                DeviceAddress::new("bob", "laptop").unwrap(),
+                address.clone(),
+                vec![1, 2, 3],
+            )
+            .await
+            .unwrap();
+        state.revoke_route_device(&address).await;
+        let mut closed = false;
+        while let Some(frame) = connection.receiver.recv().await {
+            if matches!(frame, OutboundFrame::Close) {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed);
+        assert_eq!(state.queued_messages().await, 0);
+        assert_eq!(state.queued_bytes().await, 0);
     }
 
     #[tokio::test]
