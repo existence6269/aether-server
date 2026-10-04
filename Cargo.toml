@@ -5,7 +5,8 @@ edition = "2021"
 description = "Opaque encrypted-envelope relay for Aether"
 
 [dependencies]
-aether-crypto = { git = "https://github.com/existence6269/aether-protocol.git", tag = "v0.1.0" }
+aether-crypto = { git = "https://github.com/existence6269/aether-protocol.git" }
+rev = "f335bc666df3a0768fd171f5c7249bf9a2286e20"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
