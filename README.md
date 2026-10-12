@@ -2,9 +2,11 @@
 
 `aether-server` provides the Void account directory and an asynchronous,
 in-memory WebSocket relay for Aether ciphertext envelopes. PostgreSQL is the
-authoritative account/device directory when `DATABASE_URL` is configured.
-Without it, the explicit local device allowlist remains available for relay
-development and the account API returns `503`.
+authoritative account/device directory. The binary defaults to production
+mode and refuses to start unless `DATABASE_URL` is configured and reachable.
+The static device allowlist is available only when
+`AETHER_ENV=development` is explicitly set; account endpoints are unavailable
+in that mode without PostgreSQL.
 
 This is foundational transport code. It has not been independently audited and
 is not production-ready.
@@ -16,10 +18,10 @@ is not production-ready.
   challenge; the client signs the protocol, server audience, address, identity
   key, challenge ID, and nonce using Aether's device-auth API. The server
   verifies the proof and consumes the challenge before connecting the device.
-- With PostgreSQL configured, only active account-device records authorize
-  relay connections or recipients. Otherwise the binary uses the exact
-  address/key allowlist from `AETHER_AUTHORIZED_DEVICES`; an empty or absent
-  list denies all devices.
+- Only active, non-revoked PostgreSQL account-device records authorize relay
+  connections or recipients in production. Development-only static
+  authorization uses the exact address/key allowlist from
+  `AETHER_AUTHORIZED_DEVICES`; an empty or absent list denies all devices.
 - Accounts, verified tags/emails, passkeys, and relay authorization are
   directory and access-control data only. They do **not** establish peer trust.
   Contact invitation pinning and peer trust remain client-side. Device-auth
@@ -78,7 +80,7 @@ is not production-ready.
 
 ### Multi-instance revocation operations
 
-Apply migrations through `0004_device_revocation_coordination.sql` before
+Apply migrations through `0005_device_registration_status.sql` before
 deploying this version. All instances must use the same PostgreSQL database
 and a consistent schema. For the first rollout, drain and confirm shutdown of
 every pre-coordination server before enabling revocation on this version;
@@ -326,6 +328,34 @@ and must not be the desktop React/Tauri origin.
    operators must resolve ownership before applying it. Route aliases are not
    changed by this constraint.
 
+The device API contracts are:
+
+| Method and path | Authentication | Success response |
+| --- | --- | --- |
+| `POST /api/devices/first-enrollment/challenge` | Authenticated unbound account session | `{"challenge_id":"<uuid>","challenge":{...}}` |
+| `POST /api/devices/first-enrollment/finish` | Same account session and device signature | `{"device":{"id":"<uuid>","user_id":"...","device_id":"...","display_name":"...","created_at":"...","current":true}}` |
+| `POST /api/devices/session/challenge` | Authenticated account session | `{"challenge_id":"<uuid>","challenge":{...}}` |
+| `POST /api/devices/session/finish` | Same account session and device signature | `204 No Content` |
+| `POST /api/devices/link` | Authenticated unbound session | `{"request_id":"<uuid>","approval_token":"<64 hex chars>","expires_in_seconds":3600}` |
+| `GET /api/devices/link` | Authenticated active-device session | Array of pending request objects (`request_id`, `user_id`, `device_id`, `display_name`, `created_at`) |
+| `POST /api/devices/link/{request_id}/approve` | Authenticated active-device session | `204 No Content` |
+| `POST /api/devices/link/{request_id}/complete` | The requesting unbound session | A `DeviceEntry` object |
+| `GET /api/devices` | Authenticated account session | Array of active `DeviceEntry` objects |
+| `DELETE /api/devices/{device_id}` | Account session belonging to the account | `204 No Content` after cross-instance revocation delivery completes |
+
+For additional-device linking, the start body is
+`{"device":{"user_id":"...","device_id":"..."},"identity_public_key":[32 bytes],"display_name":"..."}`.
+The complete body is `{"approval_token":"<token returned by start>"}`.
+The approval token is bound server-side to the exact account, route aliases,
+device key, requester session and request ID; approval is performed by a
+separately authenticated existing device. The link flow does not allow a
+public key alone to enroll a device.
+
+`account_devices.registration_status` is database-backed and constrained to
+`active` or `revoked`. Newly accepted first-device and approved link records
+are active; revocation changes both the status and `revoked_at` in the same
+transaction. Only active records are returned or accepted for relay auth.
+
 Email verification tokens, session bearer tokens, browser exchange codes, and
 browser state and PKCE challenge values are stored only as SHA-256 hashes in
 the database; the PKCE verifier is never sent to or stored by the server. The
@@ -345,10 +375,11 @@ All settings are environment variables; omitted values use these defaults:
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
+| `AETHER_ENV` | `production` | `production` requires PostgreSQL; only explicit `development` permits static device authorization |
 | `AETHER_BIND_ADDR` | `0.0.0.0:8080` | Listener address |
 | `AETHER_SERVER_ID` | `aether-server-local` | Signed device-authentication audience |
-| `AETHER_AUTHORIZED_DEVICES` | unset (deny all) | Semicolon-separated `user_id/device_id=64-hex-public-key` entries |
-| `DATABASE_URL` | unset | PostgreSQL URL; enables account API and database-backed relay directory |
+| `AETHER_AUTHORIZED_DEVICES` | unset (deny all) | Development-only semicolon-separated `user_id/device_id=64-hex-public-key` entries |
+| `DATABASE_URL` | required in production | PostgreSQL URL; stores accounts/devices/sessions and authorizes the production relay |
 | `AETHER_WEBAUTHN_RP_ID` | required with database | WebAuthn relying-party ID (host name) |
 | `AETHER_WEBAUTHN_ORIGIN` | required with database | Exact HTTPS hosted portal origin permitted for passkeys and account API CORS; must not be the desktop React origin |
 | `AETHER_PUBLIC_URL` | required with database | HTTPS origin used for the hosted portal and email verification links; must match `AETHER_WEBAUTHN_ORIGIN` |
@@ -378,6 +409,7 @@ metadata and connection-side buffering.
 From the repository root:
 
 ```powershell
+$env:AETHER_ENV = "development"
 $env:AETHER_BIND_ADDR = "127.0.0.1:8080"
 cargo run -p aether-server
 ```
@@ -387,6 +419,7 @@ keys, never private seeds:
 
 ```powershell
 $env:AETHER_BIND_ADDR = "127.0.0.1:8080"
+$env:AETHER_ENV = "development"
 $env:AETHER_AUTHORIZED_DEVICES = "alice/laptop=<64-HEX-PUBLIC-KEY>;bob/phone=<64-HEX-PUBLIC-KEY>"
 cargo run -p aether-server
 ```
@@ -424,8 +457,9 @@ cargo test --workspace
 ```
 
 Pure account-validation and relay tests need no production secrets. Set
-`TEST_DATABASE_URL` to an isolated disposable PostgreSQL database to also run
-the account migration smoke test.
+`TEST_DATABASE_URL` to an isolated disposable PostgreSQL database to execute
+the migration, enrollment/approval/persistence, and two-instance revocation
+integration tests. These tests create and drop per-test schemas.
 
 ## Docker / Northflank
 
@@ -434,18 +468,25 @@ Configure Northflank with the repository root as the build context and
 
 ```powershell
 docker build -f crates/aether-server/Dockerfile -t aether-server .
-docker run --rm -p 8080:8080 -e AETHER_BIND_ADDR=0.0.0.0:8080 aether-server
+docker run --rm -p 8080:8080 -e AETHER_BIND_ADDR=0.0.0.0:8080 `
+  -e AETHER_ENV=production -e DATABASE_URL `
+  -e AETHER_WEBAUTHN_RP_ID -e AETHER_WEBAUTHN_ORIGIN -e AETHER_PUBLIC_URL `
+  -e RESEND_API_KEY -e RESEND_FROM_EMAIL aether-server
 ```
 
-Without `DATABASE_URL`, the image denies all devices unless a provisional
-allowlist is configured. For account mode, configure all database, WebAuthn,
-public URL, and Resend variables in the platform's server-side environment.
+Set the listed environment variables in the hosting platform before starting
+the container. Production startup fails if `DATABASE_URL` is absent or
+unreachable, and it never consults `AETHER_AUTHORIZED_DEVICES`. The server
+automatically applies pending migrations using its PostgreSQL role; grant that
+role the schema/table/index privileges required for migrations. Keep all
+connection strings and Resend credentials server-side.
 Configure the platform's health check at `/healthz` and readiness probe at
 `/readyz`. Use TLS at the platform ingress and `wss://` clients.
 
 ## Current limitations / next phase
 
-- The static allowlist remains a local fallback only when PostgreSQL is absent.
+- The static allowlist is available only in explicitly selected development
+  mode (`AETHER_ENV=development`) when PostgreSQL is absent.
 - Account recovery, account deletion, passkey replacement, distributed passkey
   ceremony storage, and account API rate limiting are not implemented.
 - Device-auth proof alone does not protect transport confidentiality or

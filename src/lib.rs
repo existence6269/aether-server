@@ -80,13 +80,34 @@ pub async fn serve(
 pub async fn run_from_env(
     authorizer: Arc<dyn DeviceAuthorizer>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let development_mode = match std::env::var("AETHER_ENV") {
+        Ok(value) if value == "development" => true,
+        Ok(value) if value == "production" => false,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AETHER_ENV must be either 'production' or 'development'",
+            )
+            .into())
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => return Err(error.into()),
+    };
     let config = ServerConfig::from_env()?;
+    let directory = accounts::AccountDirectory::connect_from_env(&config.server_id).await?;
+    if !development_mode && directory.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DATABASE_URL is required unless AETHER_ENV=development",
+        )
+        .into());
+    }
+    let state = match directory {
+        Some(directory) => AppState::with_account_directory(config.clone(), directory)?,
+        None => AppState::new(config.clone(), authorizer)?,
+    };
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(bind_addr = %config.bind_addr, "Aether relay listening");
-    let state = match accounts::AccountDirectory::connect_from_env(&config.server_id).await? {
-        Some(directory) => AppState::with_account_directory(config, directory)?,
-        None => AppState::new(config, authorizer)?,
-    };
     serve(listener, state, shutdown_signal()).await?;
     Ok(())
 }

@@ -1194,7 +1194,8 @@ impl AccountDirectory {
     ) -> Result<Vec<DeviceEntry>, ServerError> {
         let rows = sqlx::query(
             "SELECT id, user_id, device_id, display_name, created_at::text AS created_at \
-             FROM account_devices WHERE account_id = $1 AND revoked_at IS NULL ORDER BY created_at",
+             FROM account_devices WHERE account_id = $1 \
+               AND registration_status = 'active' AND revoked_at IS NULL ORDER BY created_at",
         )
         .bind(account.account_id)
         .fetch_all(&self.inner.pool)
@@ -1239,7 +1240,8 @@ impl AccountDirectory {
             .map_err(|_| ServerError::Internal)?;
         let row = sqlx::query(
             "SELECT user_id, device_id FROM account_devices \
-             WHERE id = $1 AND account_id = $2 FOR UPDATE",
+             WHERE id = $1 AND account_id = $2 \
+               AND registration_status = 'active' AND revoked_at IS NULL FOR UPDATE",
         )
         .bind(device_id)
         .bind(account.account_id)
@@ -1254,8 +1256,9 @@ impl AccountDirectory {
                 .map_err(|_| ServerError::Internal)?,
         )?;
         let result = sqlx::query(
-            "UPDATE account_devices SET revoked_at = now() \
-             WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
+            "UPDATE account_devices SET revoked_at = now(), registration_status = 'revoked' \
+             WHERE id = $1 AND account_id = $2 \
+               AND registration_status = 'active' AND revoked_at IS NULL",
         )
         .bind(device_id)
         .bind(account.account_id)
@@ -1460,7 +1463,7 @@ impl AccountDirectory {
             }
             let row = sqlx::query(
                 "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
-                 AND revoked_at IS NULL FOR SHARE",
+                 AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
             )
             .bind(&address.user_id)
             .bind(&address.device_id)
@@ -1502,7 +1505,8 @@ impl AccountDirectory {
         }
         let active = sqlx::query(
             "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
-             AND identity_public_key = $3 AND revoked_at IS NULL",
+             AND identity_public_key = $3 AND registration_status = 'active' \
+             AND revoked_at IS NULL",
         )
         .bind(&device.user_id)
         .bind(&device.device_id)
@@ -1543,7 +1547,8 @@ impl AccountDirectory {
         .ok_or(ServerError::Unavailable)?;
         let device_id: Uuid = sqlx::query_scalar(
             "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
-             AND identity_public_key = $3 AND revoked_at IS NULL FOR SHARE",
+             AND identity_public_key = $3 AND registration_status = 'active' \
+             AND revoked_at IS NULL FOR SHARE",
         )
         .bind(&address.user_id)
         .bind(&address.device_id)
@@ -1613,7 +1618,8 @@ impl AccountDirectory {
              WHERE c.challenge_id = $1 AND c.instance_id = $2 \
                AND c.consumed_at IS NULL AND c.expires_at > now() \
                AND d.user_id = $3 AND d.device_id = $4 \
-               AND d.identity_public_key = $5 AND d.revoked_at IS NULL \
+               AND d.identity_public_key = $5 AND d.registration_status = 'active' \
+               AND d.revoked_at IS NULL \
              FOR UPDATE OF c, d",
         )
         .bind(challenge_id)
@@ -1669,7 +1675,7 @@ impl AccountDirectory {
         }
         let active = sqlx::query(
             "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
-             AND revoked_at IS NULL FOR SHARE",
+             AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
         )
         .bind(&device.user_id)
         .bind(&device.device_id)
@@ -1695,7 +1701,8 @@ impl AccountDirectory {
         sqlx::query(
             "SELECT id FROM account_devices \
              WHERE account_id = $1 AND user_id = $2 AND device_id = $3 \
-               AND identity_public_key = $4 AND revoked_at IS NULL",
+               AND identity_public_key = $4 AND registration_status = 'active' \
+               AND revoked_at IS NULL",
         )
         .bind(account.account_id)
         .bind(&request.device.user_id)
@@ -1770,7 +1777,8 @@ impl AccountDirectory {
             .map_err(|_| ServerError::Internal)?;
         let device_record: Uuid = sqlx::query_scalar(
             "SELECT id FROM account_devices WHERE account_id = $1 AND user_id = $2 \
-             AND device_id = $3 AND identity_public_key = $4 AND revoked_at IS NULL FOR SHARE",
+             AND device_id = $3 AND identity_public_key = $4 \
+             AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
         )
         .bind(ceremony.account_id)
         .bind(&ceremony.device.user_id)
@@ -1837,7 +1845,8 @@ impl AccountDirectory {
                AND s.token_hash = $2 AND s.revoked_at IS NULL \
                AND s.expires_at > now() AND s.device_id IS NULL) \
              AND NOT EXISTS (SELECT 1 FROM account_devices \
-               WHERE account_id = $1 AND revoked_at IS NULL)",
+               WHERE account_id = $1 AND registration_status = 'active' \
+                 AND revoked_at IS NULL)",
         )
         .bind(account.account_id)
         .bind(&account.session_hash)
@@ -1923,7 +1932,8 @@ impl AccountDirectory {
              WHERE token_hash = $1 AND account_id = $2 AND device_id IS NULL \
                AND revoked_at IS NULL AND expires_at > now()) \
              AND NOT EXISTS (SELECT 1 FROM account_devices \
-               WHERE account_id = $2 AND revoked_at IS NULL)",
+               WHERE account_id = $2 AND registration_status = 'active' \
+                 AND revoked_at IS NULL)",
         )
         .bind(&account.session_hash)
         .bind(account.account_id)
@@ -2152,7 +2162,7 @@ impl AccountDirectory {
         .ok_or(ServerError::InvalidRequest)?;
         sqlx::query(
             "SELECT id FROM account_devices WHERE id = $1 AND account_id = $2 \
-             AND revoked_at IS NULL FOR UPDATE",
+             AND registration_status = 'active' AND revoked_at IS NULL FOR UPDATE",
         )
         .bind(approver_device)
         .bind(account.account_id)
@@ -2178,7 +2188,8 @@ impl AccountDirectory {
              WHERE r.id = $2 AND r.account_id = $3 AND r.approved_by_device IS NULL \
                AND r.consumed_at IS NULL AND r.expires_at > now() \
                AND EXISTS (SELECT 1 FROM account_devices d WHERE d.id = $1 \
-                 AND d.account_id = $3 AND d.revoked_at IS NULL) \
+                 AND d.account_id = $3 AND d.registration_status = 'active' \
+                 AND d.revoked_at IS NULL) \
                AND EXISTS (SELECT 1 FROM account_sessions s WHERE s.token_hash = $4 \
                  AND s.account_id = $3 AND s.device_id = $1 AND s.revoked_at IS NULL \
                  AND s.expires_at > now())",
@@ -2259,7 +2270,8 @@ impl AccountDirectory {
             .map_err(|_| ServerError::Internal)?;
         let approver = sqlx::query(
             "SELECT id FROM account_devices \
-             WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL FOR UPDATE",
+             WHERE id = $1 AND account_id = $2 AND registration_status = 'active' \
+               AND revoked_at IS NULL FOR UPDATE",
         )
         .bind(approver_device)
         .bind(account.account_id)
@@ -2671,8 +2683,54 @@ mod tests {
 
     use super::{
         hash_token, normalize_tag, validate_email, validate_profile_update, validate_tag,
-        AccountProfileUpdate,
+        AccountDirectory, AccountProfileUpdate, AuthenticatedAccount, FirstDeviceFinish,
+        FirstDeviceStart, LinkComplete, LinkStart,
     };
+    use crate::DeviceAddress;
+    use aether_crypto::Identity;
+    use uuid::Uuid;
+
+    async fn insert_test_account(directory: &AccountDirectory) -> (AuthenticatedAccount, String) {
+        let account_id = Uuid::new_v4();
+        let suffix = account_id.simple().to_string();
+        sqlx::query(
+            "INSERT INTO accounts \
+             (id, tag, tag_normalized, email, email_normalized, email_verified_at) \
+             VALUES ($1, $2, $2, $3, $3, now())",
+        )
+        .bind(account_id)
+        .bind(format!("t{}", &suffix[..10]))
+        .bind(format!("{suffix}@example.invalid"))
+        .execute(&directory.inner.pool)
+        .await
+        .expect("insert test account");
+        insert_unbound_test_session(directory, account_id).await
+    }
+
+    async fn insert_unbound_test_session(
+        directory: &AccountDirectory,
+        account_id: Uuid,
+    ) -> (AuthenticatedAccount, String) {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let session_hash = hash_token(&token);
+        sqlx::query(
+            "INSERT INTO account_sessions (token_hash, account_id, expires_at) \
+             VALUES ($1, $2, now() + interval '1 day')",
+        )
+        .bind(&session_hash)
+        .bind(account_id)
+        .execute(&directory.inner.pool)
+        .await
+        .expect("insert test session");
+        (
+            AuthenticatedAccount {
+                account_id,
+                session_hash,
+                device_id: None,
+            },
+            token,
+        )
+    }
 
     #[test]
     fn account_tags_are_validated_case_insensitively_and_reserved_names_rejected() {
@@ -2815,6 +2873,223 @@ mod tests {
         assert!(identity_key_index.contains("UNIQUE INDEX"));
         assert!(identity_key_index.contains("(identity_public_key)"));
         assert!(!identity_key_index.contains("(account_id, identity_public_key)"));
+        let registration_status_column: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'account_devices' \
+               AND column_name = 'registration_status' AND is_nullable = 'NO')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("device registration status column must exist");
+        assert!(registration_status_column);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_device_enrollment_approval_and_persistence() {
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping PostgreSQL device enrollment test: TEST_DATABASE_URL is unset");
+            return;
+        };
+        let schema = format!("registration_test_{}", Uuid::new_v4().simple());
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("TEST_DATABASE_URL must be reachable");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin_pool)
+            .await
+            .expect("create isolated registration schema");
+
+        let directory =
+            AccountDirectory::test_directory(&database_url, "registration-test", &schema)
+                .await
+                .expect("test PostgreSQL database is reachable and migrations apply");
+        let (bootstrap_session, bootstrap_token) = insert_test_account(&directory).await;
+        let device = DeviceAddress::new("registered_user", "desktop").unwrap();
+        let identity = Identity::from_secret_bytes(&[91; 32]).unwrap();
+        let unauthenticated = AuthenticatedAccount {
+            account_id: bootstrap_session.account_id,
+            session_hash: vec![0; 32],
+            device_id: None,
+        };
+        assert!(directory
+            .start_first_device(
+                &unauthenticated,
+                FirstDeviceStart {
+                    device: device.clone(),
+                    identity_public_key: *identity.public_key().as_bytes(),
+                    display_name: "Desktop".to_owned(),
+                },
+            )
+            .await
+            .is_err());
+        let first = directory
+            .start_first_device(
+                &bootstrap_session,
+                FirstDeviceStart {
+                    device: device.clone(),
+                    identity_public_key: *identity.public_key().as_bytes(),
+                    display_name: "Desktop".to_owned(),
+                },
+            )
+            .await
+            .expect("authenticated account may start first-device enrollment");
+        let proof = identity
+            .sign_device_auth_challenge(&first.challenge)
+            .expect("first device signs its challenge");
+        let enrolled = directory
+            .finish_first_device(
+                &bootstrap_session,
+                FirstDeviceFinish {
+                    challenge_id: first.challenge_id,
+                    proof,
+                },
+            )
+            .await
+            .expect("valid device proof registers first device");
+        assert!(directory
+            .finish_first_device(
+                &bootstrap_session,
+                FirstDeviceFinish {
+                    challenge_id: first.challenge_id,
+                    proof: identity
+                        .sign_device_auth_challenge(&first.challenge)
+                        .expect("replay proof can be constructed"),
+                },
+            )
+            .await
+            .is_err());
+
+        let bound_session = directory
+            .authenticate(&bootstrap_token)
+            .await
+            .expect("first-device registration binds the session");
+        assert_eq!(bound_session.device_id, Some(enrolled.device.id));
+
+        let (link_session, _) =
+            insert_unbound_test_session(&directory, bootstrap_session.account_id).await;
+        let additional_device = DeviceAddress::new("registered_user", "phone").unwrap();
+        let additional_identity = Identity::from_secret_bytes(&[92; 32]).unwrap();
+        let link = directory
+            .start_link(
+                &link_session,
+                LinkStart {
+                    device: additional_device.clone(),
+                    identity_public_key: *additional_identity.public_key().as_bytes(),
+                    display_name: "Phone".to_owned(),
+                },
+            )
+            .await
+            .expect("unbound authenticated session may request another device");
+        assert_eq!(
+            directory.pending_links(&bound_session).await.unwrap().len(),
+            1
+        );
+        directory
+            .approve_link(&bound_session, link.request_id)
+            .await
+            .expect("existing registered device approves exact request");
+        assert!(directory
+            .approve_link(&bound_session, link.request_id)
+            .await
+            .is_err());
+        let linked = directory
+            .complete_link(
+                &link_session,
+                link.request_id,
+                LinkComplete {
+                    approval_token: link.approval_token,
+                },
+            )
+            .await
+            .expect("requesting session consumes its approved token");
+        assert_eq!(linked.user_id, additional_device.user_id);
+        assert_eq!(linked.device_id, additional_device.device_id);
+
+        let second_directory =
+            AccountDirectory::test_directory(&database_url, "registration-test", &schema)
+                .await
+                .expect("second directory instance connects to same database");
+        let persisted_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM account_devices \
+             WHERE account_id = $1 AND registration_status = 'active' AND revoked_at IS NULL",
+        )
+        .bind(bootstrap_session.account_id)
+        .fetch_one(&second_directory.inner.pool)
+        .await
+        .expect("registered devices persist in PostgreSQL");
+        assert_eq!(persisted_count, 2);
+        assert_eq!(
+            second_directory
+                .devices(&bound_session)
+                .await
+                .expect("second directory lists persisted devices")
+                .len(),
+            2
+        );
+        let instance_id = Uuid::new_v4();
+        second_directory
+            .register_relay_instance(instance_id)
+            .await
+            .expect("second instance registers against shared database");
+        second_directory
+            .authorize_for_instance(identity.public_key(), &device, instance_id)
+            .await
+            .expect("newly enrolled device is authorized from another directory");
+        let (revoked_address, event_id) = directory
+            .revoke_device(&bound_session, enrolled.device.id)
+            .await
+            .expect("authenticated account revokes registered device");
+        assert_eq!(revoked_address, device);
+        let pending = second_directory
+            .pending_revocations(instance_id)
+            .await
+            .expect("other instance recovers durable revocation");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, event_id);
+        second_directory
+            .acknowledge_revocation(instance_id, event_id)
+            .await
+            .expect("instance acknowledges revocation");
+        directory
+            .wait_for_revocation(event_id)
+            .await
+            .expect("revocation completes after instance acknowledgment");
+        assert!(second_directory
+            .authorize_for_instance(identity.public_key(), &device, instance_id)
+            .await
+            .is_err());
+        let registration_status: String =
+            sqlx::query_scalar("SELECT registration_status FROM account_devices WHERE id = $1")
+                .bind(enrolled.device.id)
+                .fetch_one(&second_directory.inner.pool)
+                .await
+                .expect("revocation status persists");
+        assert_eq!(registration_status, "revoked");
+        second_directory
+            .fence_relay_instance(instance_id)
+            .await
+            .expect("test instance is fenced");
+        assert!(second_directory
+            .start_first_device(
+                &bootstrap_session,
+                FirstDeviceStart {
+                    device: DeviceAddress::new("other_alias", "other_device").unwrap(),
+                    identity_public_key: *identity.public_key().as_bytes(),
+                    display_name: "Key reuse".to_owned(),
+                },
+            )
+            .await
+            .is_err());
+
+        directory.close_test_pool().await;
+        second_directory.close_test_pool().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin_pool)
+            .await
+            .expect("drop isolated registration schema");
+        admin_pool.close().await;
     }
 }

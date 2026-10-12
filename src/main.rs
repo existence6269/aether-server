@@ -1,6 +1,6 @@
 use std::{error::Error, sync::Arc};
 
-use aether_server::{run_from_env, StaticDeviceAuthorizer};
+use aether_server::{run_from_env, RejectAllAuthenticator, StaticDeviceAuthorizer};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -13,14 +13,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .compact()
         .try_init()?;
 
-    let using_directory = std::env::var_os("DATABASE_URL").is_some();
-    let authorizer = if using_directory {
-        StaticDeviceAuthorizer::new()
+    let development_mode = std::env::var("AETHER_ENV")
+        .map(|value| value == "development")
+        .unwrap_or(false);
+    let authorizer: Arc<dyn aether_server::DeviceAuthorizer> = if development_mode {
+        Arc::new(StaticDeviceAuthorizer::from_env()?)
     } else {
-        StaticDeviceAuthorizer::from_env()?
+        Arc::new(RejectAllAuthenticator)
     };
-    if !using_directory && std::env::var_os("AETHER_AUTHORIZED_DEVICES").is_none() {
-        tracing::warn!("no device allowlist is configured; WebSocket clients are rejected");
+    if development_mode && std::env::var_os("AETHER_AUTHORIZED_DEVICES").is_none() {
+        tracing::warn!("development mode has no device allowlist; WebSocket clients are rejected");
     }
-    run_from_env(Arc::new(authorizer)).await
+    run_from_env(authorizer).await
 }
