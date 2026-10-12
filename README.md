@@ -22,7 +22,7 @@ is not production-ready.
   connections or recipients in production. Development-only static
   authorization uses the exact address/key allowlist from
   `AETHER_AUTHORIZED_DEVICES`; an empty or absent list denies all devices.
-- Accounts, verified tags/emails, passkeys, and relay authorization are
+- Account tags, optional contact emails, passkeys, and relay authorization are
   directory and access-control data only. They do **not** establish peer trust.
   Contact invitation pinning and peer trust remain client-side. Device-auth
   proof is separate from DM encryption.
@@ -80,7 +80,7 @@ is not production-ready.
 
 ### Multi-instance revocation operations
 
-Apply migrations through `0005_device_registration_status.sql` before
+Apply migrations through `0006_signup_rate_limits.sql` before
 deploying this version. All instances must use the same PostgreSQL database
 and a consistent schema. For the first rollout, drain and confirm shutdown of
 every pre-coordination server before enabling revocation on this version;
@@ -95,10 +95,10 @@ acknowledged nor explicitly fenced. It can return a server error on a database
 failure after revocation has committed; the durable event remains and the
 request can be retried after coordination recovers.
 
-The two-instance PostgreSQL integration test requires `TEST_DATABASE_URL` to
+The PostgreSQL integration tests require `TEST_DATABASE_URL` to
 point to a disposable PostgreSQL database where the test role can create and
-drop schemas. Without that variable the test reports a skip; the regular unit
-tests do not substitute for this database-backed coverage.
+drop schemas. Without that variable these tests skip; the regular unit tests
+do not substitute for this database-backed coverage.
 
 The relay remains an opaque ciphertext-envelope router. PostgreSQL coordination
 stores only routing/device metadata and revocation event status; it does not
@@ -184,7 +184,7 @@ error or log entry.
 - `GET /account/signup` and `/account/signin` serve same-origin system-browser
   passkey pages when the PostgreSQL account directory is configured.
 - `GET /account` is the hosted account portal linking the hosted signup and
-  signin pages and reporting successful email verification.
+  signin pages.
 
 Health endpoints intentionally reveal only a fixed status string.
 
@@ -199,24 +199,27 @@ hosted signup/signin forms at `/account/signup` and `/account/signin`. The forms
 use the browser WebAuthn API against the configured API origin. Passkey
 credential objects live only in page memory; pages do not persist them, create
 API sessions, use server-managed session cookies, or store bearer tokens.
-Email verification returns to the portal with a success notice; expired or
-invalid verification links show an accessible explanation without echoing the
-token. Signup instructs users to verify email and return to the desktop app to
-sign in. The hosted page's WebAuthn RP origin is the configured
+Email verification remains implemented for account email changes, but it is
+not part of signup or sign-in. The signup page reports account creation only.
+Expired or invalid email-change links show an accessible explanation without
+echoing the token. The hosted page's
+WebAuthn RP origin is the configured
 `AETHER_WEBAUTHN_ORIGIN`, which must be the hosted account portal's HTTPS origin
 and must not be the desktop React/Tauri origin.
 
 1. `POST /api/accounts/signup` with `{"tag":"alice","email":"alice@example.org"}`
    creates an immutable random UUID account ID, reserves the case-insensitive
-   unique tag/email, emails a verification link through Resend, and returns a
-   short-lived WebAuthn registration ceremony ID and browser creation options.
+   unique tag/email, and returns a short-lived WebAuthn registration ceremony
+   ID and browser creation options. Signup starts are limited to 30 per
+   database-wide minute window across all instances.
    Tags are 3–24 ASCII letters, digits, or underscores; common service,
    administrative, and Void-reserved names are rejected case-insensitively.
 2. Complete `navigator.credentials.create()` in the system browser and POST
    `{"ceremony_id":"…","credential":{…}}` to
    `/api/accounts/signup/finish`. The server verifies and persists the passkey.
-   The emailed GET link verifies the email at `/api/accounts/email/verify`;
-   clients may also POST `{"token":"…"}` to that endpoint.
+   An account cannot sign in or appear in the public directory until its
+   passkey registration has completed. Email is contact information, not an
+   authentication factor; the account is owned by the passkey.
 3. For Tauri system-browser sign-in, first have the native client listen on an
    available loopback port at an exact path, e.g.
    `http://127.0.0.1:49152/void/callback`. Generate separate 32-byte
@@ -264,7 +267,7 @@ and must not be the desktop React/Tauri origin.
    contract; never place the bearer token in a callback URL.
    `POST /api/accounts/logout` revokes the current session;
    `GET /api/accounts/me` returns only the current account summary:
-   `{"account_id":"<uuid>","tag":"alice","email_verified":true,"email_change_pending":false}`.
+   `{"account_id":"<uuid>","tag":"alice","email_verified":false,"email_change_pending":false}`.
    `PATCH /api/accounts/me` requires the same bearer authorization and accepts
    one or both editable fields, for example
    `{"tag":"new_tag","email":"new@example.org"}`. Omitted fields are unchanged;
@@ -274,16 +277,17 @@ and must not be the desktop React/Tauri origin.
    `account_id` nor any device IDs or DeviceAddress aliases.
 
    Email edits reserve a globally case-insensitive unique pending address and
-   send its verification link through Resend. Until that link is verified, the
-   currently verified email remains active; the pending address is not used
-   for sign-in recovery or exposed by the API. The response remains the public
+   send its verification link through Resend when email delivery is configured.
+   Until that link is verified, the current email remains active; the pending
+   address is not used for sign-in recovery or exposed by the API. The response remains the public
    account summary, with `email_change_pending: true` indicating a pending
    change and no address or token. Successful verification atomically promotes
    the pending email and clears the pending state; invalid, expired, or
    superseded links do not change the active email. Submitting the active
    email again cancels any pending change. Email delivery failure does not
    replace the active email and the failed pending request is cleared.
-4. `GET /api/directory/{tag}` returns only the account UUID and public tag.
+4. `GET /api/directory/{tag}` returns only the account UUID and public tag for
+   accounts with a completed passkey registration.
    It never returns email addresses, devices, or identity keys. Directory
    lookup does not pin contacts or establish trust.
 5. The just-exchanged passkey session is initially unbound. If
@@ -382,9 +386,9 @@ All settings are environment variables; omitted values use these defaults:
 | `DATABASE_URL` | required in production | PostgreSQL URL; stores accounts/devices/sessions and authorizes the production relay |
 | `AETHER_WEBAUTHN_RP_ID` | required with database | WebAuthn relying-party ID (host name) |
 | `AETHER_WEBAUTHN_ORIGIN` | required with database | Exact HTTPS hosted portal origin permitted for passkeys and account API CORS; must not be the desktop React origin |
-| `AETHER_PUBLIC_URL` | required with database | HTTPS origin used for the hosted portal and email verification links; must match `AETHER_WEBAUTHN_ORIGIN` |
-| `RESEND_API_KEY` | required with database | Resend secret; configure only in the server environment |
-| `RESEND_FROM_EMAIL` | required with database | Verified sender address configured in Resend |
+| `AETHER_PUBLIC_URL` | optional | HTTPS origin used for email-change verification; configure together with both Resend settings and match `AETHER_WEBAUTHN_ORIGIN` |
+| `RESEND_API_KEY` | optional | Resend secret for email-change confirmation; configure only on the server together with the other email-delivery settings |
+| `RESEND_FROM_EMAIL` | optional | Verified sender address for email-change confirmation; configure with the other email-delivery settings |
 | `AETHER_DATABASE_MAX_CONNECTIONS` | `20` | PostgreSQL connection pool limit |
 | `AETHER_DATABASE_CONNECT_TIMEOUT_SECS` | `10` | PostgreSQL pool acquire/connect timeout |
 | `AETHER_MAX_CONNECTIONS` | `10000` | Concurrent authenticated device sockets |
@@ -424,14 +428,16 @@ $env:AETHER_AUTHORIZED_DEVICES = "alice/laptop=<64-HEX-PUBLIC-KEY>;bob/phone=<64
 cargo run -p aether-server
 ```
 
-For accounts, configure PostgreSQL and the server-side email/WebAuthn values.
-Migrations run automatically at startup. Do not configure Resend credentials in
-the frontend or commit them:
+For accounts, configure PostgreSQL and WebAuthn values. Migrations run
+automatically at startup. Email changes require all three optional email
+delivery settings; signup and sign-in do not. Never configure Resend credentials
+in the frontend or commit them:
 
 ```powershell
 $env:DATABASE_URL = "<PostgreSQL connection URL>"
 $env:AETHER_WEBAUTHN_RP_ID = "void.example.org"
 $env:AETHER_WEBAUTHN_ORIGIN = "https://void.example.org"
+# Optional: required only for email-change confirmation
 $env:AETHER_PUBLIC_URL = "https://void.example.org"
 $env:RESEND_API_KEY = "<server secret>"
 $env:RESEND_FROM_EMAIL = "accounts@void.example.org"
@@ -470,16 +476,16 @@ Configure Northflank with the repository root as the build context and
 docker build -f crates/aether-server/Dockerfile -t aether-server .
 docker run --rm -p 8080:8080 -e AETHER_BIND_ADDR=0.0.0.0:8080 `
   -e AETHER_ENV=production -e DATABASE_URL `
-  -e AETHER_WEBAUTHN_RP_ID -e AETHER_WEBAUTHN_ORIGIN -e AETHER_PUBLIC_URL `
-  -e RESEND_API_KEY -e RESEND_FROM_EMAIL aether-server
+  -e AETHER_WEBAUTHN_RP_ID -e AETHER_WEBAUTHN_ORIGIN aether-server
 ```
 
 Set the listed environment variables in the hosting platform before starting
 the container. Production startup fails if `DATABASE_URL` is absent or
 unreachable, and it never consults `AETHER_AUTHORIZED_DEVICES`. The server
 automatically applies pending migrations using its PostgreSQL role; grant that
-role the schema/table/index privileges required for migrations. Keep all
-connection strings and Resend credentials server-side.
+role the schema/table/index privileges required for migrations. If email-change
+confirmation is needed, configure all three optional email-delivery settings
+server-side.
 Configure the platform's health check at `/healthz` and readiness probe at
 `/readyz`. Use TLS at the platform ingress and `wss://` clients.
 
@@ -487,8 +493,9 @@ Configure the platform's health check at `/healthz` and readiness probe at
 
 - The static allowlist is available only in explicitly selected development
   mode (`AETHER_ENV=development`) when PostgreSQL is absent.
-- Account recovery, account deletion, passkey replacement, distributed passkey
-  ceremony storage, and account API rate limiting are not implemented.
+- Account recovery, account deletion, passkey replacement, and distributed
+  passkey ceremony storage are not implemented. Signup starts are limited by
+  one database-wide rate counter (30 per minute), not per source IP.
 - Device-auth proof alone does not protect transport confidentiality or
   authenticate the relay to the client; deploy TLS and use `wss://`.
 - Offline storage is bounded but volatile, single-process memory. There is no

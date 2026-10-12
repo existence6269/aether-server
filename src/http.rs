@@ -198,20 +198,18 @@ const ACCOUNT_PORTAL_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Void account</title><style>
 body{font:16px system-ui,sans-serif;max-width:36rem;margin:10vh auto;padding:1rem;color:#222}
-a{color:#164b80}li{margin:1rem 0}#notice{padding:1rem;background:#edf7ed}
+a{color:#164b80}li{margin:1rem 0}
 </style></head><body><main><h1>Void account</h1>
 <p>Use a passkey in this system browser to create your account. To sign in to the Void desktop app, start sign-in in the app; it opens this page with a one-time secure return to the app.</p>
-<p id="notice" role="status" aria-live="polite" hidden>Email verified. Return to Void and choose “Sign in” to continue.</p>
 <nav aria-label="Account actions"><ul>
 <li><a id="signin" href="/account/signin">Sign in with a passkey</a></li>
 <li><a href="/account/signup">Create an account with a passkey</a></li>
 </ul></nav>
 <p>Your passkey stays with your authenticator. This page keeps credential data only in memory and never stores a bearer token.</p>
 </main><script>
-const p=new URLSearchParams(location.search),notice=document.getElementById("notice");
-if(p.get("verified")==="1")notice.hidden=false;
+const p=new URLSearchParams(location.search);
 const callbackUri=p.get("callback_uri"),state=p.get("state"),codeChallenge=p.get("code_challenge");
-if(callbackUri&&state&&codeChallenge){const u=new URL("/account/signin",location.origin);u.searchParams.set("callback_uri",callbackUri);u.searchParams.set("state",state);u.searchParams.set("code_challenge",codeChallenge);document.getElementById("signin").href=u.pathname+u.search}
+if(callbackUri&&state&&codeChallenge){const u=new URL("/account/signin",location.origin);u.searchParams.set("callback_uri",callbackUri);u.searchParams.set("state",state);u.searchParams.set("code_challenge",codeChallenge);if(p.get("tag"))u.searchParams.set("tag",p.get("tag"));document.getElementById("signin").href=u.pathname+u.search}
 </script></body></html>"#;
 
 const SYSTEM_BROWSER_SIGNIN_HTML: &str = r#"<!doctype html>
@@ -227,6 +225,7 @@ input,button{font:inherit;padding:.75rem}button{cursor:pointer}
 <script>
 const form=document.getElementById("signin"),status=document.getElementById("status");
 const params=new URLSearchParams(location.search),callbackUri=params.get("callback_uri"),state=params.get("state"),codeChallenge=params.get("code_challenge");
+document.getElementById("tag").value=params.get("tag")||"";
 async function apiError(response,fallback){let code="";try{code=(await response.json()).error||""}catch(_){}const messages={invalid_request:"Check the account details and try again.",unauthorized:"The tag or passkey could not be verified. Check the tag and try again.",resource_limit:"Too many sign-in attempts are pending. Wait a moment and try again.",unavailable:"Account services are temporarily unavailable.",internal:"The server could not complete sign-in. Try again later."};return messages[code]||fallback}
 function b64url(bytes){let s="";for(const b of new Uint8Array(bytes))s+=String.fromCharCode(b);return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
 function fromB64url(s){const p=s.replace(/-/g,"+").replace(/_/g,"/");return Uint8Array.from(atob(p+"=".repeat((4-p.length%4)%4)),c=>c.charCodeAt(0))}
@@ -252,6 +251,7 @@ input,button{font:inherit;padding:.75rem}button{cursor:pointer}
 </style></head><body><h1>Create a Void account</h1>
 <form id="signup"><label for="tag">Void tag</label><input id="tag" autocomplete="username" required minlength="3" maxlength="24">
 <label for="email">Email</label><input id="email" type="email" autocomplete="email" required maxlength="320">
+<small>Email is contact information; you do not need to verify it to sign in.</small>
 <button type="submit">Create account with passkey</button></form><p id="status" role="status" aria-live="polite"></p>
 <script>
 const form=document.getElementById("signup"),status=document.getElementById("status");
@@ -268,7 +268,7 @@ if(!start.ok)throw new Error(await apiError(start,"Could not start account creat
 publicKey.challenge=fromB64url(publicKey.challenge);publicKey.user.id=fromB64url(publicKey.user.id);if(publicKey.excludeCredentials)publicKey.excludeCredentials=publicKey.excludeCredentials.map(c=>({...c,id:fromB64url(c.id)}));
 const credential=await navigator.credentials.create({publicKey});
 const finish=await fetch("/api/accounts/signup/finish",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ceremony_id:ceremony.ceremony_id,credential:credentialJson(credential)})});
-if(!finish.ok)throw new Error(await apiError(finish,"Passkey registration failed."));form.hidden=true;status.textContent="Account created. Check your email to verify it, then return to Void and sign in.";
+if(!finish.ok)throw new Error(await apiError(finish,"Passkey registration failed."));form.hidden=true;status.textContent="Account created. Return to Void.";
 }catch(error){status.textContent=error instanceof DOMException&&error.name==="NotAllowedError"?"Passkey registration was cancelled or timed out. You can try again.":error instanceof Error?error.message:"Account creation could not be completed. Check the tag and email, then try again.";form.querySelector("button").disabled=false}});
 </script></body></html>"#;
 
@@ -294,7 +294,7 @@ async fn verify_email_link(
         }
         Err(error) => return Err(error),
     }
-    let mut response = axum::response::Redirect::to("/account?verified=1").into_response();
+    let mut response = axum::response::Redirect::to("/account").into_response();
     set_account_page_headers(&mut response);
     Ok(response)
 }
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn hosted_system_browser_pages_use_webauthn_and_do_not_persist_tokens() {
-        assert!(ACCOUNT_PORTAL_HTML.contains("role=\"status\""));
+        assert!(!ACCOUNT_PORTAL_HTML.contains("verified=1"));
         assert!(!ACCOUNT_PORTAL_HTML.contains("localStorage"));
         assert!(!ACCOUNT_PORTAL_HTML.contains("sessionStorage"));
         assert!(SYSTEM_BROWSER_SIGNIN_HTML.contains("navigator.credentials.get"));
@@ -552,6 +552,12 @@ mod tests {
         assert!(!SYSTEM_BROWSER_SIGNIN_HTML.contains("session_token"));
         assert!(ACCOUNT_PORTAL_HTML.contains("Create an account with a passkey"));
         assert!(ACCOUNT_PORTAL_HTML.contains("Sign in with a passkey"));
+        assert!(!ACCOUNT_PORTAL_HTML.contains("verified=1"));
+        assert!(!ACCOUNT_PORTAL_HTML.contains("Email verified"));
+        assert!(SYSTEM_BROWSER_SIGNUP_HTML.contains("id=\"email\" type=\"email\""));
+        assert!(!SYSTEM_BROWSER_SIGNUP_HTML.contains("Check your email to verify it"));
+        assert!(ACCOUNT_PORTAL_HTML.contains("p.get(\"tag\")"));
+        assert!(SYSTEM_BROWSER_SIGNIN_HTML.contains("params.get(\"tag\")"));
         assert!(EMAIL_VERIFICATION_ERROR_HTML.contains("may be invalid, expired"));
         assert!(!EMAIL_VERIFICATION_ERROR_HTML.contains("token"));
     }

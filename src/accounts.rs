@@ -29,6 +29,7 @@ const SESSION_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 const DEVICE_LINK_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_PENDING_CEREMONIES: usize = 10_000;
 const MAX_PENDING_RELAY_CHALLENGES: i64 = 10_000;
+const MAX_SIGNUPS_PER_MINUTE: i32 = 30;
 const INSTANCE_REGISTRY_LOCK: i64 = 0x4145_5448_4552;
 const REVOCATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -47,9 +48,9 @@ struct DirectoryInner {
     webauthn: Webauthn,
     server_id: String,
     webauthn_origin: String,
-    public_url: String,
-    resend_api_key: String,
-    resend_from_email: String,
+    public_url: Option<String>,
+    resend_api_key: Option<String>,
+    resend_from_email: Option<String>,
     http: Client,
     registrations: Mutex<HashMap<Uuid, RegistrationCeremony>>,
     authentications: Mutex<HashMap<Uuid, AuthenticationCeremony>>,
@@ -315,9 +316,9 @@ impl AccountDirectory {
                 webauthn,
                 server_id: server_id.to_owned(),
                 webauthn_origin: origin.origin().ascii_serialization(),
-                public_url: "https://localhost".to_owned(),
-                resend_api_key: "test".to_owned(),
-                resend_from_email: "test@example.invalid".to_owned(),
+                public_url: Some("https://localhost".to_owned()),
+                resend_api_key: Some("test".to_owned()),
+                resend_from_email: Some("test@example.invalid".to_owned()),
                 http: Client::new(),
                 registrations: Mutex::new(HashMap::new()),
                 authentications: Mutex::new(HashMap::new()),
@@ -392,36 +393,34 @@ impl AccountDirectory {
 
         let rp_id = required_env("AETHER_WEBAUTHN_RP_ID")?;
         let rp_origin = required_env("AETHER_WEBAUTHN_ORIGIN")?;
-        let public_url = required_env("AETHER_PUBLIC_URL")?;
-        let public_origin = Url::parse(&public_url)
-            .map_err(|_| ServerError::InvalidConfiguration("AETHER_PUBLIC_URL"))?;
-        if public_origin.scheme() != "https"
-            || public_origin.host_str().is_none()
-            || !public_origin.username().is_empty()
-            || public_origin.password().is_some()
-            || !matches!(public_origin.path(), "" | "/")
-            || public_origin.query().is_some()
-            || public_origin.fragment().is_some()
+        let public_url = optional_env("AETHER_PUBLIC_URL")?;
+        let resend_api_key = optional_env("RESEND_API_KEY")?;
+        let resend_from_email = optional_env("RESEND_FROM_EMAIL")?;
+        let email_delivery_configured =
+            public_url.is_some() && resend_api_key.is_some() && resend_from_email.is_some();
+        if [
+            public_url.is_some(),
+            resend_api_key.is_some(),
+            resend_from_email.is_some(),
+        ]
+        .iter()
+        .any(|configured| *configured)
+            && !email_delivery_configured
         {
             return Err(ServerError::InvalidConfiguration(
-                "AETHER_PUBLIC_URL must be an HTTPS origin",
+                "AETHER_PUBLIC_URL, RESEND_API_KEY, and RESEND_FROM_EMAIL must be configured together",
             ));
         }
-        let resend_api_key = required_env("RESEND_API_KEY")?;
-        let resend_from_email = required_env("RESEND_FROM_EMAIL")?;
         let database_max_connections = env_u32("AETHER_DATABASE_MAX_CONNECTIONS", 20)?;
         let database_connect_timeout_secs = env_u32("AETHER_DATABASE_CONNECT_TIMEOUT_SECS", 10)?;
-        validate_email(&resend_from_email).map_err(|_| {
-            ServerError::InvalidConfiguration("RESEND_FROM_EMAIL must be a valid email")
-        })?;
+        if let Some(from_email) = resend_from_email.as_deref() {
+            validate_email(from_email).map_err(|_| {
+                ServerError::InvalidConfiguration("RESEND_FROM_EMAIL must be a valid email")
+            })?;
+        }
 
         let origin = Url::parse(&rp_origin)
             .map_err(|_| ServerError::InvalidConfiguration("AETHER_WEBAUTHN_ORIGIN"))?;
-        if public_origin.origin() != origin.origin() {
-            return Err(ServerError::InvalidConfiguration(
-                "AETHER_PUBLIC_URL must use the WebAuthn browser origin",
-            ));
-        }
         if origin.scheme() != "https"
             || origin.host_str().is_none()
             || !origin.username().is_empty()
@@ -433,6 +432,27 @@ impl AccountDirectory {
             return Err(ServerError::InvalidConfiguration(
                 "AETHER_WEBAUTHN_ORIGIN must be an HTTPS origin",
             ));
+        }
+        if let Some(public_url) = public_url.as_deref() {
+            let public_origin = Url::parse(public_url)
+                .map_err(|_| ServerError::InvalidConfiguration("AETHER_PUBLIC_URL"))?;
+            if public_origin.scheme() != "https"
+                || public_origin.host_str().is_none()
+                || !public_origin.username().is_empty()
+                || public_origin.password().is_some()
+                || !matches!(public_origin.path(), "" | "/")
+                || public_origin.query().is_some()
+                || public_origin.fragment().is_some()
+            {
+                return Err(ServerError::InvalidConfiguration(
+                    "AETHER_PUBLIC_URL must be an HTTPS origin",
+                ));
+            }
+            if public_origin.origin() != origin.origin() {
+                return Err(ServerError::InvalidConfiguration(
+                    "AETHER_PUBLIC_URL must use the WebAuthn browser origin",
+                ));
+            }
         }
         let webauthn = WebauthnBuilder::new(&rp_id, &origin)
             .map_err(|_| ServerError::InvalidConfiguration("WebAuthn RP configuration"))?
@@ -458,7 +478,7 @@ impl AccountDirectory {
                 webauthn,
                 server_id: server_id.to_owned(),
                 webauthn_origin: origin.origin().ascii_serialization(),
-                public_url: public_url.trim_end_matches('/').to_owned(),
+                public_url: public_url.map(|value| value.trim_end_matches('/').to_owned()),
                 resend_api_key,
                 resend_from_email,
                 http: Client::builder()
@@ -490,8 +510,6 @@ impl AccountDirectory {
             .start_passkey_registration(account_id, &tag, &tag, None)
             .map_err(|_| ServerError::Internal)?;
         let ceremony_id = Uuid::new_v4();
-        let email_token = opaque_token();
-        let token_hash = hash_token(&email_token);
         let normalized_tag = normalize_tag(&tag);
         let normalized_email = email.to_ascii_lowercase();
 
@@ -501,6 +519,36 @@ impl AccountDirectory {
             .begin()
             .await
             .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "DELETE FROM account_signup_rate_limits \
+             WHERE window_start < date_trunc('minute', now()) - interval '1 hour'",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        let signup_count: Option<i32> = sqlx::query_scalar(
+            "INSERT INTO account_signup_rate_limits (window_start, signup_count) \
+             VALUES (date_trunc('minute', now()), 1) \
+             ON CONFLICT (window_start) DO UPDATE \
+               SET signup_count = account_signup_rate_limits.signup_count + 1 \
+               WHERE account_signup_rate_limits.signup_count < $1 \
+             RETURNING signup_count",
+        )
+        .bind(MAX_SIGNUPS_PER_MINUTE)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if signup_count.is_none() {
+            return Err(ServerError::ResourceLimit);
+        }
+        sqlx::query(
+            "DELETE FROM accounts a \
+             WHERE a.created_at < now() - interval '10 minutes' \
+               AND NOT EXISTS (SELECT 1 FROM account_passkeys p WHERE p.account_id = a.id)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&normalized_email)
             .execute(&mut *transaction)
@@ -524,24 +572,6 @@ impl AccountDirectory {
                 ServerError::Internal
             }
         })?;
-        sqlx::query(
-            "INSERT INTO email_verification_challenges \
-             (id, account_id, token_hash, expires_at, purpose, target_email_normalized) \
-             VALUES ($1, $2, $3, now() + ($4::double precision * interval '1 second'), 'signup', $5)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(account_id)
-        .bind(token_hash)
-        .bind(EMAIL_TOKEN_TTL.as_secs() as i64)
-        .bind(&normalized_email)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| ServerError::Internal)?;
-
-        let verification_url = format!(
-            "{}/api/accounts/email/verify?token={}",
-            self.inner.public_url, email_token
-        );
         transaction
             .commit()
             .await
@@ -559,17 +589,6 @@ impl AccountDirectory {
             )
             .await
         {
-            let _ = sqlx::query("DELETE FROM accounts WHERE id = $1")
-                .bind(account_id)
-                .execute(&self.inner.pool)
-                .await;
-            return Err(error);
-        }
-        if let Err(error) = self
-            .send_verification_email(&email, &verification_url)
-            .await
-        {
-            self.inner.registrations.lock().await.remove(&ceremony_id);
             let _ = sqlx::query("DELETE FROM accounts WHERE id = $1")
                 .bind(account_id)
                 .execute(&self.inner.pool)
@@ -595,20 +614,32 @@ impl AccountDirectory {
             .map_err(|_| ServerError::InvalidRequest)?;
         let credential_id = passkey.cred_id().as_ref().to_vec();
         let credential = serde_json::to_value(passkey).map_err(|_| ServerError::Internal)?;
-        let result = sqlx::query(
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
             "INSERT INTO account_passkeys (credential_id, account_id, credential) \
              VALUES ($1, $2, $3)",
         )
         .bind(credential_id)
         .bind(ceremony.account_id)
         .bind(credential)
-        .execute(&self.inner.pool)
-        .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(error) if is_unique_violation(&error) => Err(ServerError::InvalidRequest),
-            Err(_) => Err(ServerError::Internal),
-        }
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                ServerError::InvalidRequest
+            } else {
+                ServerError::Internal
+            }
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
     }
 
     pub(crate) async fn start_signin(
@@ -620,7 +651,8 @@ impl AccountDirectory {
         validate_browser_state(&request.state)?;
         let code_challenge = validate_code_challenge(&request.code_challenge)?;
         let row = sqlx::query(
-            "SELECT id FROM accounts WHERE tag_normalized = $1 AND email_verified_at IS NOT NULL",
+            "SELECT a.id FROM accounts a WHERE a.tag_normalized = $1 \
+             AND EXISTS (SELECT 1 FROM account_passkeys p WHERE p.account_id = a.id)",
         )
         .bind(normalize_tag(&tag))
         .fetch_optional(&self.inner.pool)
@@ -704,14 +736,6 @@ impl AccountDirectory {
             .await
             .map_err(|_| ServerError::Internal)?;
         }
-        let row =
-            sqlx::query("SELECT tag FROM accounts WHERE id = $1 AND email_verified_at IS NOT NULL")
-                .bind(ceremony.account_id)
-                .fetch_optional(&self.inner.pool)
-                .await
-                .map_err(|_| ServerError::Internal)?
-                .ok_or(ServerError::Unauthorized)?;
-        let tag: String = row.try_get("tag").map_err(|_| ServerError::Internal)?;
         let exchange_code = opaque_token();
         let code_hash = hash_token(&exchange_code);
         sqlx::query(
@@ -775,13 +799,12 @@ impl AccountDirectory {
         let account_id: Uuid = row
             .try_get("account_id")
             .map_err(|_| ServerError::Internal)?;
-        let account =
-            sqlx::query("SELECT tag FROM accounts WHERE id = $1 AND email_verified_at IS NOT NULL")
-                .bind(account_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|_| ServerError::Internal)?
-                .ok_or(ServerError::Unauthorized)?;
+        let account = sqlx::query("SELECT tag FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?
+            .ok_or(ServerError::Unauthorized)?;
         let tag: String = account.try_get("tag").map_err(|_| ServerError::Internal)?;
         let token = opaque_token();
         let hash = hash_token(&token);
@@ -1050,6 +1073,13 @@ impl AccountDirectory {
                 .await
                 .map_err(|_| ServerError::Internal)?;
             } else {
+                let (Some(public_url), Some(_), Some(_)) = (
+                    self.inner.public_url.as_deref(),
+                    self.inner.resend_api_key.as_deref(),
+                    self.inner.resend_from_email.as_deref(),
+                ) else {
+                    return Err(ServerError::Unavailable);
+                };
                 let already_reserved = sqlx::query(
                     "SELECT 1 FROM accounts \
                      WHERE id <> $1 AND (email_normalized = $2 OR pending_email_normalized = $2) \
@@ -1111,7 +1141,7 @@ impl AccountDirectory {
 
                 let verification_url = format!(
                     "{}/api/accounts/email/verify?token={}",
-                    self.inner.public_url, email_token
+                    public_url, email_token
                 );
                 if self
                     .send_verification_email(&email, &verification_url)
@@ -1175,7 +1205,8 @@ impl AccountDirectory {
     pub(crate) async fn lookup_tag(&self, tag: &str) -> Result<DirectoryEntry, ServerError> {
         let tag = validate_tag(tag)?;
         let row = sqlx::query(
-            "SELECT id, tag FROM accounts WHERE tag_normalized = $1 AND email_verified_at IS NOT NULL",
+            "SELECT a.id, a.tag FROM accounts a WHERE a.tag_normalized = $1 \
+             AND EXISTS (SELECT 1 FROM account_passkeys p WHERE p.account_id = a.id)",
         )
         .bind(normalize_tag(&tag))
         .fetch_optional(&self.inner.pool)
@@ -1841,7 +1872,7 @@ impl AccountDirectory {
         let eligible: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM accounts a \
              JOIN account_sessions s ON s.account_id = a.id \
-             WHERE a.id = $1 AND a.email_verified_at IS NOT NULL \
+             WHERE a.id = $1 \
                AND s.token_hash = $2 AND s.revoked_at IS NULL \
                AND s.expires_at > now() AND s.device_id IS NULL) \
              AND NOT EXISTS (SELECT 1 FROM account_devices \
@@ -2022,10 +2053,8 @@ impl AccountDirectory {
             .map_err(|_| ServerError::Internal)?;
         let session_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM account_sessions s \
-             JOIN accounts a ON a.id = s.account_id \
              WHERE s.token_hash = $1 AND s.account_id = $2 AND s.device_id IS NULL \
-               AND s.revoked_at IS NULL AND s.expires_at > now() \
-               AND a.email_verified_at IS NOT NULL)",
+               AND s.revoked_at IS NULL AND s.expires_at > now())",
         )
         .bind(&account.session_hash)
         .bind(account.account_id)
@@ -2398,13 +2427,23 @@ impl AccountDirectory {
         to: &str,
         verification_url: &str,
     ) -> Result<(), ServerError> {
+        let api_key = self
+            .inner
+            .resend_api_key
+            .as_deref()
+            .ok_or(ServerError::Unavailable)?;
+        let from_email = self
+            .inner
+            .resend_from_email
+            .as_deref()
+            .ok_or(ServerError::Unavailable)?;
         let response = self
             .inner
             .http
             .post("https://api.resend.com/emails")
-            .bearer_auth(&self.inner.resend_api_key)
+            .bearer_auth(api_key)
             .json(&serde_json::json!({
-                "from": self.inner.resend_from_email,
+                "from": from_email,
                 "to": [to],
                 "subject": "Verify your Void account email",
                 "html": format!(
@@ -2597,6 +2636,15 @@ fn required_env(name: &'static str) -> Result<String, ServerError> {
     }
 }
 
+fn optional_env(name: &'static str) -> Result<Option<String>, ServerError> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) => Err(ServerError::InvalidConfiguration(name)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(ServerError::InvalidConfiguration(name)),
+    }
+}
+
 fn env_u32(name: &'static str, default: u32) -> Result<u32, ServerError> {
     match env::var(name) {
         Ok(value) => value
@@ -2684,7 +2732,7 @@ mod tests {
     use super::{
         hash_token, normalize_tag, validate_email, validate_profile_update, validate_tag,
         AccountDirectory, AccountProfileUpdate, AuthenticatedAccount, FirstDeviceFinish,
-        FirstDeviceStart, LinkComplete, LinkStart,
+        FirstDeviceStart, LinkComplete, LinkStart, SignupRequest, MAX_SIGNUPS_PER_MINUTE,
     };
     use crate::DeviceAddress;
     use aether_crypto::Identity;
@@ -2882,7 +2930,64 @@ mod tests {
         .await
         .expect("device registration status column must exist");
         assert!(registration_status_column);
+        let signup_rate_limit_table: bool = sqlx::query_scalar(
+            "SELECT to_regclass(format('%I.%I', current_schema(), 'account_signup_rate_limits')) IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("signup rate-limit table must exist");
+        assert!(signup_rate_limit_table);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_signup_rate_limit_is_shared_across_directories() {
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping PostgreSQL signup-rate-limit test: TEST_DATABASE_URL is unset");
+            return;
+        };
+        let schema = format!("signup_limit_test_{}", Uuid::new_v4().simple());
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("TEST_DATABASE_URL must be reachable");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin_pool)
+            .await
+            .expect("create isolated signup rate-limit schema");
+        let first = AccountDirectory::test_directory(&database_url, "signup-limit", &schema)
+            .await
+            .expect("first PostgreSQL directory connects");
+        let second = AccountDirectory::test_directory(&database_url, "signup-limit", &schema)
+            .await
+            .expect("second PostgreSQL directory connects");
+        for attempt in 0..MAX_SIGNUPS_PER_MINUTE {
+            let directory = if attempt % 2 == 0 { &first } else { &second };
+            directory
+                .signup(SignupRequest {
+                    tag: format!("signup_{attempt}"),
+                    email: format!("signup_{attempt}@example.invalid"),
+                })
+                .await
+                .expect("signup rate budget is shared across server directories");
+        }
+        assert!(matches!(
+            second
+                .signup(SignupRequest {
+                    tag: "signup_over_limit".to_owned(),
+                    email: "signup_over_limit@example.invalid".to_owned(),
+                })
+                .await,
+            Err(crate::ServerError::ResourceLimit)
+        ));
+        first.close_test_pool().await;
+        second.close_test_pool().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin_pool)
+            .await
+            .expect("drop isolated signup rate-limit schema");
+        admin_pool.close().await;
     }
 
     #[tokio::test]
