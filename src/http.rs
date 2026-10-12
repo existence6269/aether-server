@@ -353,8 +353,8 @@ async fn revoke_device(
 ) -> Result<StatusCode, ServerError> {
     let directory = directory(&state)?;
     let account = account_from_headers(&state, &headers).await?;
-    let address = directory.revoke_device(&account, device_id).await?;
-    state.revoke_route_device(&address).await;
+    let (_address, event_id) = directory.revoke_device(&account, device_id).await?;
+    directory.wait_for_revocation(event_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -474,7 +474,10 @@ mod tests {
 
     use crate::{auth::RejectAllAuthenticator, config::ServerConfig, state::AppState};
 
-    use super::router;
+    use super::{
+        router, ACCOUNT_PORTAL_HTML, EMAIL_VERIFICATION_ERROR_HTML, SYSTEM_BROWSER_SIGNIN_HTML,
+        SYSTEM_BROWSER_SIGNUP_HTML,
+    };
 
     #[tokio::test]
     async fn health_and_readiness_track_shutdown_state() {

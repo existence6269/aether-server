@@ -33,6 +33,39 @@ is not production-ready.
 - Queues are process-local and are lost on restart. Delivery is at-least-once:
   an unacknowledged envelope is retried after reconnect, so clients should
   deduplicate using `message_id`.
+- PostgreSQL-backed relay instances register before serving. Authentication,
+  relay ingress, and each delivery write check the instance and active device
+  records in PostgreSQL. Device revocation commits an outbox event and per-
+  instance delivery records in the same transaction. Each instance removes
+  the local route and sender-originated queued envelopes before acknowledging
+  its event; revocation returns success only after every targeted instance has
+  acknowledged or has been explicitly fenced.
+- The revocation linearization point is the PostgreSQL transaction that marks
+  the device revoked and inserts the outbox event. Authentication consumes a
+  database-backed, instance-bound one-use challenge while locking the active
+  device row through local route registration. Relay ingress checks both
+  endpoints under PostgreSQL row locks and a local per-device gate; delivery
+  rechecks both endpoints immediately before socket write. A node acknowledges
+  revocation only after its local gates drain and routes/queued envelopes are
+  removed. No PostgreSQL transaction is held across socket I/O.
+- No instance lease expires automatically. A crashed or unreachable instance
+  therefore keeps revocation pending. Operators must first remove that node
+  from load balancers/network access and ensure its process cannot serve
+  traffic, then explicitly fence its recorded instance ID:
+
+  ```sql
+  UPDATE relay_instances
+  SET fenced_at = now()
+  WHERE instance_id = '<instance-id-from-server-log>'
+    AND fenced_at IS NULL;
+  ```
+
+  The UUID is logged when the instance registers. Never run this update merely
+  because a heartbeat or timeout expired. Graceful shutdown marks an instance
+  fenced only after Axum has drained its WebSocket handlers. A restarted
+  process receives a new instance ID and reconciles existing outbox history
+  before accepting traffic. PostgreSQL availability is required for auth and
+  relay; coordination failures deny new auth/sends and prevent delivery writes.
 - Authentication secrets, message payloads, ciphertext bytes, and envelope
   contents are not logged. Tracing reports only server lifecycle, connection
   lifecycle, and error codes; HTTP request/body tracing is not enabled.
@@ -42,6 +75,32 @@ is not production-ready.
 - The server does not provide TLS termination. Deploy behind a trusted TLS
   endpoint and configure forwarded-header handling only in the hosting
   environment.
+
+### Multi-instance revocation operations
+
+Apply migrations through `0004_device_revocation_coordination.sql` before
+deploying this version. All instances must use the same PostgreSQL database
+and a consistent schema. For the first rollout, drain and confirm shutdown of
+every pre-coordination server before enabling revocation on this version;
+older processes are not present in the instance registry and cannot be
+invalidated by this protocol. Do not manually delete rows from `relay_instances`,
+`device_revocation_outbox`, or `device_revocation_deliveries`; these records
+are required to recover pending revocations after missed polling or restarts.
+An instance that crashes remains an unacknowledged revocation target until an
+operator has externally fenced it and sets `fenced_at`. The account revoke
+request intentionally remains pending while any target is neither
+acknowledged nor explicitly fenced. It can return a server error on a database
+failure after revocation has committed; the durable event remains and the
+request can be retried after coordination recovers.
+
+The two-instance PostgreSQL integration test requires `TEST_DATABASE_URL` to
+point to a disposable PostgreSQL database where the test role can create and
+drop schemas. Without that variable the test reports a skip; the regular unit
+tests do not substitute for this database-backed coverage.
+
+The relay remains an opaque ciphertext-envelope router. PostgreSQL coordination
+stores only routing/device metadata and revocation event status; it does not
+read or transform payload bytes or participate in Noise/ratchet sessions.
 
 ## WebSocket protocol
 

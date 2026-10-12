@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -7,8 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aether_crypto::{DeviceAuthChallenge, IdentityPublicKey};
-use tokio::sync::{mpsc, watch, Mutex};
+use aether_crypto::{DeviceAuthChallenge, DeviceAuthProof, IdentityPublicKey};
+use tokio::sync::{mpsc, watch, Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::{
@@ -18,6 +20,7 @@ use crate::{
 
 const AUTH_CHALLENGE_REPLAY_RETENTION: Duration = Duration::from_secs(10 * 60);
 const MAX_AUTH_CHALLENGE_REPLAY_IDS: usize = 1_000_000;
+const AUTHORIZATION_LOCK_STRIPES: usize = 64;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,7 +33,10 @@ struct Inner {
     accounts: Option<AccountDirectory>,
     hub: Mutex<Hub>,
     used_auth_challenges: Mutex<HashMap<[u8; 16], Instant>>,
+    authorization_locks: [Arc<Mutex<()>>; AUTHORIZATION_LOCK_STRIPES],
     next_connection_id: AtomicU64,
+    instance_id: Uuid,
+    coordination_healthy: AtomicBool,
     accepting: AtomicBool,
     shutdown: watch::Sender<bool>,
 }
@@ -60,6 +66,15 @@ pub(crate) struct ConnectionHandle {
     pub receiver: mpsc::Receiver<OutboundFrame>,
 }
 
+pub(crate) struct DeviceAuthorizationGuard {
+    device: DeviceAddress,
+    _guard: OwnedMutexGuard<()>,
+}
+
+pub(crate) struct DeviceAuthorizationGuards {
+    _guards: Vec<OwnedMutexGuard<()>>,
+}
+
 pub(crate) enum OutboundFrame {
     Protocol(ServerFrame),
     Pong(Vec<u8>),
@@ -78,7 +93,11 @@ impl AppState {
         config: ServerConfig,
         directory: AccountDirectory,
     ) -> Result<Self, ServerError> {
-        Self::build(config, Arc::new(directory.clone()), Some(directory))
+        Self::build(
+            config,
+            Arc::new(crate::RejectAllAuthenticator),
+            Some(directory),
+        )
     }
 
     fn build(
@@ -88,6 +107,7 @@ impl AppState {
     ) -> Result<Self, ServerError> {
         config.validate()?;
         let (shutdown, _) = watch::channel(false);
+        let coordination_healthy = accounts.is_none();
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
@@ -95,7 +115,10 @@ impl AppState {
                 accounts,
                 hub: Mutex::new(Hub::default()),
                 used_auth_challenges: Mutex::new(HashMap::new()),
+                authorization_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
                 next_connection_id: AtomicU64::new(1),
+                instance_id: Uuid::new_v4(),
+                coordination_healthy: AtomicBool::new(coordination_healthy),
                 accepting: AtomicBool::new(true),
                 shutdown,
             }),
@@ -106,12 +129,49 @@ impl AppState {
         self.inner.accounts.as_ref()
     }
 
+    pub(crate) fn instance_id(&self) -> Uuid {
+        self.inner.instance_id
+    }
+
+    pub(crate) async fn start_coordination(&self) -> Result<(), ServerError> {
+        if let Some(accounts) = &self.inner.accounts {
+            accounts
+                .register_relay_instance(self.inner.instance_id)
+                .await?;
+            self.inner
+                .coordination_healthy
+                .store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn poll_revocations(&self) -> Result<(), ServerError> {
+        let Some(accounts) = &self.inner.accounts else {
+            return Ok(());
+        };
+        for event in accounts.pending_revocations(self.inner.instance_id).await? {
+            let guard = self.lock_device_authorization(&event.address).await;
+            self.revoke_route_device(&event.address, guard).await?;
+            accounts
+                .acknowledge_revocation(self.inner.instance_id, event.event_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_coordination_health(&self, healthy: bool) {
+        self.inner
+            .coordination_healthy
+            .store(healthy, Ordering::Release);
+    }
+
     pub fn config(&self) -> &ServerConfig {
         &self.inner.config
     }
 
     pub fn is_ready(&self) -> bool {
         self.inner.accepting.load(Ordering::Acquire)
+            && self.inner.coordination_healthy.load(Ordering::Acquire)
     }
 
     pub fn stop_accepting(&self) {
@@ -132,15 +192,98 @@ impl AppState {
             return Err(ServerError::ShuttingDown);
         }
         device.validate()?;
-        self.inner.authorizer.authorize(identity, device).await
+        if let Some(accounts) = &self.inner.accounts {
+            accounts
+                .authorize_for_instance(identity, device, self.inner.instance_id)
+                .await
+        } else {
+            self.inner.authorizer.authorize(identity, device).await
+        }
     }
 
     pub async fn authorize_recipient(&self, device: &DeviceAddress) -> Result<(), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
         device.validate()?;
-        self.inner.authorizer.authorize_recipient(device).await
+        if let Some(accounts) = &self.inner.accounts {
+            accounts
+                .authorize_recipient_for_instance(device, self.inner.instance_id)
+                .await
+        } else {
+            self.inner.authorizer.authorize_recipient(device).await
+        }
     }
 
-    pub(crate) async fn revoke_route_device(&self, address: &DeviceAddress) {
+    pub(crate) async fn register_auth_challenge(
+        &self,
+        identity: IdentityPublicKey,
+        device: &DeviceAddress,
+        challenge: &DeviceAuthChallenge,
+    ) -> Result<(), ServerError> {
+        if let Some(accounts) = &self.inner.accounts {
+            accounts
+                .issue_auth_challenge(
+                    Uuid::from_bytes(*challenge.challenge_id()),
+                    identity,
+                    device,
+                    self.inner.instance_id,
+                )
+                .await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn lock_device_authorization(
+        &self,
+        device: &DeviceAddress,
+    ) -> DeviceAuthorizationGuard {
+        let stripe = self.authorization_stripe(device);
+        DeviceAuthorizationGuard {
+            device: device.clone(),
+            _guard: Arc::clone(&self.inner.authorization_locks[stripe])
+                .lock_owned()
+                .await,
+        }
+    }
+
+    fn authorization_stripe(&self, device: &DeviceAddress) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        device.hash(&mut hasher);
+        hasher.finish() as usize % self.inner.authorization_locks.len()
+    }
+
+    pub(crate) async fn lock_devices_authorization(
+        &self,
+        first: &DeviceAddress,
+        second: &DeviceAddress,
+    ) -> DeviceAuthorizationGuards {
+        let mut stripes = [
+            self.authorization_stripe(first),
+            self.authorization_stripe(second),
+        ];
+        stripes.sort_unstable();
+        let count = if stripes[0] == stripes[1] { 1 } else { 2 };
+        let mut guards = Vec::with_capacity(count);
+        for stripe in stripes.into_iter().take(count) {
+            guards.push(
+                Arc::clone(&self.inner.authorization_locks[stripe])
+                    .lock_owned()
+                    .await,
+            );
+        }
+        DeviceAuthorizationGuards { _guards: guards }
+    }
+
+    pub(crate) async fn revoke_route_device(
+        &self,
+        address: &DeviceAddress,
+        authorization_guard: DeviceAuthorizationGuard,
+    ) -> Result<(), ServerError> {
+        if &authorization_guard.device != address {
+            return Err(ServerError::Internal);
+        }
         let sender = {
             let mut hub = self.inner.hub.lock().await;
             let sender = hub
@@ -151,11 +294,136 @@ impl AppState {
                 hub.queued_messages -= mailbox.messages.len();
                 hub.queued_bytes -= mailbox.bytes;
             }
+            let mut removed_messages = 0;
+            let mut removed_bytes = 0;
+            for mailbox in hub.mailboxes.values_mut() {
+                let before_count = mailbox.messages.len();
+                let before_bytes = mailbox.bytes;
+                mailbox
+                    .messages
+                    .retain(|envelope| &envelope.sender != address);
+                mailbox.bytes = mailbox
+                    .messages
+                    .iter()
+                    .map(|envelope| envelope.payload.len())
+                    .sum();
+                removed_messages += before_count - mailbox.messages.len();
+                removed_bytes += before_bytes - mailbox.bytes;
+            }
+            hub.queued_messages -= removed_messages;
+            hub.queued_bytes -= removed_bytes;
+            let connected_devices: HashSet<_> = hub.connections.keys().cloned().collect();
+            hub.mailboxes.retain(|device, mailbox| {
+                !mailbox.messages.is_empty() || connected_devices.contains(device)
+            });
             sender
         };
+        drop(authorization_guard);
         if let Some(sender) = sender {
-            let _ = sender.send(OutboundFrame::Close).await;
+            let _ = sender.try_send(OutboundFrame::Close);
         }
+        Ok(())
+    }
+
+    pub(crate) async fn connect_authenticated(
+        &self,
+        identity: IdentityPublicKey,
+        device: &DeviceAddress,
+        challenge: &DeviceAuthChallenge,
+        returned_challenge_id: &[u8; 16],
+        proof: &DeviceAuthProof,
+        authorization_guard: &DeviceAuthorizationGuard,
+    ) -> Result<ConnectionHandle, ServerError> {
+        if &authorization_guard.device != device
+            || challenge.audience() != self.inner.config.server_id
+            || challenge.user_id() != device.user_id
+            || challenge.device_id() != device.device_id
+            || challenge.identity_key() != identity
+        {
+            return Err(ServerError::Unauthorized);
+        }
+        if returned_challenge_id != challenge.challenge_id() {
+            return Err(ServerError::Unauthorized);
+        }
+        if let Some(accounts) = &self.inner.accounts {
+            let challenge_id = Uuid::from_bytes(*challenge.challenge_id());
+            let transaction = accounts
+                .consume_auth_challenge(challenge_id, identity, device, self.inner.instance_id)
+                .await?;
+            if identity
+                .verify_device_auth_challenge(challenge, proof)
+                .is_err()
+            {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| ServerError::Internal)?;
+                return Err(ServerError::Unauthorized);
+            }
+            let handle = self.connect(device.clone()).await?;
+            if transaction.commit().await.is_err() {
+                self.disconnect(device, handle.id).await;
+                return Err(ServerError::Internal);
+            }
+            Ok(handle)
+        } else {
+            self.consume_auth_challenge(challenge).await?;
+            if identity
+                .verify_device_auth_challenge(challenge, proof)
+                .is_err()
+            {
+                return Err(ServerError::Unauthorized);
+            }
+            self.authorize_device(identity, device).await?;
+            self.connect(device.clone()).await
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_authenticated_paused(
+        &self,
+        identity: IdentityPublicKey,
+        device: &DeviceAddress,
+        challenge: &DeviceAuthChallenge,
+        returned_challenge_id: &[u8; 16],
+        proof: &DeviceAuthProof,
+        authorization_guard: &DeviceAuthorizationGuard,
+        locked: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<ConnectionHandle, ServerError> {
+        if &authorization_guard.device != device
+            || challenge.audience() != self.inner.config.server_id
+            || challenge.user_id() != device.user_id
+            || challenge.device_id() != device.device_id
+            || challenge.identity_key() != identity
+            || returned_challenge_id != challenge.challenge_id()
+            || identity
+                .verify_device_auth_challenge(challenge, proof)
+                .is_err()
+        {
+            return Err(ServerError::Unauthorized);
+        }
+        let accounts = self
+            .inner
+            .accounts
+            .as_ref()
+            .ok_or(ServerError::Unavailable)?;
+        let transaction = accounts
+            .consume_auth_challenge(
+                Uuid::from_bytes(*challenge.challenge_id()),
+                identity,
+                device,
+                self.inner.instance_id,
+            )
+            .await?;
+        let _ = locked.send(());
+        let _ = resume.await;
+        let handle = self.connect(device.clone()).await?;
+        if transaction.commit().await.is_err() {
+            self.disconnect(device, handle.id).await;
+            return Err(ServerError::Internal);
+        }
+        Ok(handle)
     }
 
     pub(crate) async fn consume_auth_challenge(
@@ -248,8 +516,88 @@ impl AppState {
         recipient: DeviceAddress,
         payload: Vec<u8>,
     ) -> Result<Uuid, ServerError> {
+        self.enqueue_from_after_authorization(sender, connection_id, recipient, payload, async {})
+            .await
+    }
+
+    async fn enqueue_from_after_authorization<F>(
+        &self,
+        sender: &DeviceAddress,
+        connection_id: u64,
+        recipient: DeviceAddress,
+        payload: Vec<u8>,
+        after_authorization: F,
+    ) -> Result<Uuid, ServerError>
+    where
+        F: Future<Output = ()>,
+    {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        let _guards = self.lock_devices_authorization(sender, &recipient).await;
+        self.authorize_relay_pair(sender, &recipient).await?;
+        after_authorization.await;
         self.enqueue_inner(sender.clone(), recipient, payload, Some(connection_id))
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn enqueue_from_paused(
+        &self,
+        sender: &DeviceAddress,
+        connection_id: u64,
+        recipient: DeviceAddress,
+        payload: Vec<u8>,
+        started: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<Uuid, ServerError> {
+        self.enqueue_from_after_authorization(
+            sender,
+            connection_id,
+            recipient,
+            payload,
+            async move {
+                let _ = started.send(());
+                let _ = resume.await;
+            },
+        )
+        .await
+    }
+
+    async fn authorize_relay_pair(
+        &self,
+        sender: &DeviceAddress,
+        recipient: &DeviceAddress,
+    ) -> Result<(), ServerError> {
+        if let Some(accounts) = &self.inner.accounts {
+            accounts
+                .authorize_relay_pair(sender, recipient, self.inner.instance_id)
+                .await
+        } else {
+            self.inner.authorizer.authorize_recipient(sender).await?;
+            self.inner.authorizer.authorize_recipient(recipient).await
+        }
+    }
+
+    pub(crate) async fn authorize_delivery(
+        &self,
+        sender: &DeviceAddress,
+        recipient: &DeviceAddress,
+    ) -> Result<(), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        self.authorize_relay_pair(sender, recipient).await
+    }
+
+    pub(crate) async fn is_current_connection(&self, address: &DeviceAddress, id: u64) -> bool {
+        self.inner
+            .hub
+            .lock()
+            .await
+            .connections
+            .get(address)
+            .is_some_and(|connection| connection.id == id)
     }
 
     #[cfg(test)]
@@ -351,6 +699,11 @@ impl AppState {
         connection_id: u64,
         message_id: Uuid,
     ) -> Result<(), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        let _guard = self.lock_device_authorization(recipient).await;
+        self.authorize_recipient(recipient).await?;
         let mut hub = self.inner.hub.lock().await;
         let connection = hub
             .connections
@@ -546,11 +899,7 @@ mod tests {
         }
 
         async fn authorize_recipient(&self, device: &DeviceAddress) -> Result<(), ServerError> {
-            if device == &DeviceAddress::new("test-user", "test-device")? {
-                Ok(())
-            } else {
-                Err(ServerError::Unauthorized)
-            }
+            device.validate()
         }
     }
 
@@ -781,7 +1130,11 @@ mod tests {
             )
             .await
             .unwrap();
-        state.revoke_route_device(&address).await;
+        let authorization_guard = state.lock_device_authorization(&address).await;
+        state
+            .revoke_route_device(&address, authorization_guard)
+            .await
+            .unwrap();
         let mut closed = false;
         while let Some(frame) = connection.receiver.recv().await {
             if matches!(frame, OutboundFrame::Close) {
@@ -825,6 +1178,145 @@ mod tests {
         assert!(state.consume_auth_challenge(&challenge).await.is_ok());
         assert!(matches!(
             state.consume_auth_challenge(&challenge).await,
+            Err(ServerError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_replay_attempts_consume_a_challenge_once() {
+        let identity = Identity::from_secret_bytes(&[47; 32]).unwrap();
+        let challenge = DeviceAuthChallenge::new(
+            "local-relay",
+            "test-user",
+            "test-device",
+            identity.public_key(),
+            [13; 16],
+            [14; 32],
+        )
+        .unwrap();
+        let state = state_with_limits(2, 4, 4);
+        let (first, second) = tokio::join!(
+            state.consume_auth_challenge(&challenge),
+            state.consume_auth_challenge(&challenge)
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(matches!(first.and(second), Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn authenticated_connection_consumes_its_challenge_once() {
+        let identity = Identity::from_secret_bytes(&[45; 32]).unwrap();
+        let address = DeviceAddress::new("test-user", "test-device").unwrap();
+        let challenge = DeviceAuthChallenge::new(
+            ServerConfig::default().server_id,
+            address.user_id.clone(),
+            address.device_id.clone(),
+            identity.public_key(),
+            [9; 16],
+            [10; 32],
+        )
+        .unwrap();
+        let state = state_with_limits(4, 8, 8);
+        let guard = state.lock_device_authorization(&address).await;
+        let proof = identity.sign_device_auth_challenge(&challenge).unwrap();
+        let _connection = state
+            .connect_authenticated(
+                identity.public_key(),
+                &address,
+                &challenge,
+                challenge.challenge_id(),
+                &proof,
+                &guard,
+            )
+            .await
+            .expect("registered device authenticates");
+        assert!(matches!(
+            state
+                .connect_authenticated(
+                    identity.public_key(),
+                    &address,
+                    &challenge,
+                    challenge.challenge_id(),
+                    &proof,
+                    &guard
+                )
+                .await,
+            Err(ServerError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoked_device_cannot_consume_challenge_into_a_connection() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct RevocableAuth(AtomicBool);
+
+        #[async_trait::async_trait]
+        impl DeviceAuthorizer for RevocableAuth {
+            async fn authorize(
+                &self,
+                _identity: IdentityPublicKey,
+                _device: &DeviceAddress,
+            ) -> Result<(), ServerError> {
+                if self.0.load(Ordering::Acquire) {
+                    Err(ServerError::Unauthorized)
+                } else {
+                    Ok(())
+                }
+            }
+
+            async fn authorize_recipient(
+                &self,
+                _device: &DeviceAddress,
+            ) -> Result<(), ServerError> {
+                Ok(())
+            }
+        }
+
+        let identity = Identity::from_secret_bytes(&[46; 32]).unwrap();
+        let address = DeviceAddress::new("test-user", "test-device").unwrap();
+        let challenge = DeviceAuthChallenge::new(
+            ServerConfig::default().server_id,
+            address.user_id.clone(),
+            address.device_id.clone(),
+            identity.public_key(),
+            [11; 16],
+            [12; 32],
+        )
+        .unwrap();
+        let authorizer = Arc::new(RevocableAuth(AtomicBool::new(false)));
+        let state = AppState::new(ServerConfig::default(), authorizer.clone()).unwrap();
+        authorizer.0.store(true, Ordering::Release);
+        let guard = state.lock_device_authorization(&address).await;
+        let proof = identity.sign_device_auth_challenge(&challenge).unwrap();
+        assert!(matches!(
+            state
+                .connect_authenticated(
+                    identity.public_key(),
+                    &address,
+                    &challenge,
+                    challenge.challenge_id(),
+                    &proof,
+                    &guard
+                )
+                .await,
+            Err(ServerError::Unauthorized)
+        ));
+        authorizer.0.store(false, Ordering::Release);
+        assert!(matches!(
+            state
+                .connect_authenticated(
+                    identity.public_key(),
+                    &address,
+                    &challenge,
+                    challenge.challenge_id(),
+                    &proof,
+                    &guard
+                )
+                .await,
             Err(ServerError::Unauthorized)
         ));
     }

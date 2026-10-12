@@ -7,13 +7,13 @@ use std::{
 };
 
 use aether_crypto::{DeviceAuthChallenge, DeviceAuthProof, IdentityPublicKey};
-use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use tokio::sync::Mutex;
+use sha2::{Digest, Sha256};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
+use tokio::{sync::Mutex, time::sleep};
 use uuid::Uuid;
 use webauthn_rs::prelude::{
     CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
@@ -21,13 +21,21 @@ use webauthn_rs::prelude::{
     WebauthnBuilder,
 };
 
-use crate::{DeviceAddress, DeviceAuthorizer, ServerError};
+use crate::{DeviceAddress, ServerError};
 
 const EMAIL_TOKEN_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 const PASSKEY_CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 const DEVICE_LINK_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_PENDING_CEREMONIES: usize = 10_000;
+const MAX_PENDING_RELAY_CHALLENGES: i64 = 10_000;
+const INSTANCE_REGISTRY_LOCK: i64 = 0x4145_5448_4552;
+const REVOCATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+pub(crate) struct PendingRevocation {
+    pub event_id: Uuid,
+    pub address: DeviceAddress,
+}
 
 #[derive(Clone)]
 pub(crate) struct AccountDirectory {
@@ -275,6 +283,97 @@ pub(crate) struct AuthenticatedAccount {
 }
 
 impl AccountDirectory {
+    #[cfg(test)]
+    pub(crate) async fn test_directory(
+        database_url: &str,
+        server_id: &str,
+        schema: &str,
+    ) -> Result<Self, ServerError> {
+        let options = database_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .map_err(|_| ServerError::InvalidConfiguration("test database URL"))?
+            .options([("search_path", schema)]);
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let origin = Url::parse("https://localhost")
+            .map_err(|_| ServerError::InvalidConfiguration("test origin"))?;
+        let webauthn = WebauthnBuilder::new("localhost", &origin)
+            .map_err(|_| ServerError::InvalidConfiguration("test WebAuthn"))?
+            .rp_name("Void")
+            .build()
+            .map_err(|_| ServerError::InvalidConfiguration("test WebAuthn"))?;
+        Ok(Self {
+            inner: Arc::new(DirectoryInner {
+                pool,
+                webauthn,
+                server_id: server_id.to_owned(),
+                webauthn_origin: origin.origin().ascii_serialization(),
+                public_url: "https://localhost".to_owned(),
+                resend_api_key: "test".to_owned(),
+                resend_from_email: "test@example.invalid".to_owned(),
+                http: Client::new(),
+                registrations: Mutex::new(HashMap::new()),
+                authentications: Mutex::new(HashMap::new()),
+                device_challenges: Mutex::new(HashMap::new()),
+                first_device_challenges: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_test_device(
+        &self,
+        device: &DeviceAddress,
+        identity: IdentityPublicKey,
+    ) -> Result<(Uuid, AuthenticatedAccount), ServerError> {
+        let account_id = Uuid::new_v4();
+        let suffix = account_id.simple().to_string();
+        sqlx::query(
+            "INSERT INTO accounts (id, tag, tag_normalized, email, email_normalized) \
+             VALUES ($1, $2, $2, $3, $3)",
+        )
+        .bind(account_id)
+        .bind(format!("t{}", &suffix[..10]))
+        .bind(format!("{suffix}@example.invalid"))
+        .execute(&self.inner.pool)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        let device_record_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO account_devices \
+             (id, account_id, user_id, device_id, identity_public_key, display_name) \
+             VALUES ($1, $2, $3, $4, $5, 'test device')",
+        )
+        .bind(device_record_id)
+        .bind(account_id)
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .bind(identity.as_bytes().as_slice())
+        .execute(&self.inner.pool)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        Ok((
+            device_record_id,
+            AuthenticatedAccount {
+                account_id,
+                session_hash: vec![0; 32],
+                device_id: Some(device_record_id),
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_test_pool(&self) {
+        self.inner.pool.close().await;
+    }
+
     pub(crate) async fn connect_from_env(server_id: &str) -> Result<Option<Self>, ServerError> {
         let database_url = match env::var("DATABASE_URL") {
             Ok(value) if !value.is_empty() => value,
@@ -1126,16 +1225,21 @@ impl AccountDirectory {
         &self,
         account: &AuthenticatedAccount,
         device_id: Uuid,
-    ) -> Result<DeviceAddress, ServerError> {
+    ) -> Result<(DeviceAddress, Uuid), ServerError> {
         let mut transaction = self
             .inner
             .pool
             .begin()
             .await
             .map_err(|_| ServerError::Internal)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(INSTANCE_REGISTRY_LOCK)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?;
         let row = sqlx::query(
             "SELECT user_id, device_id FROM account_devices \
-             WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL FOR UPDATE",
+             WHERE id = $1 AND account_id = $2 FOR UPDATE",
         )
         .bind(device_id)
         .bind(account.account_id)
@@ -1158,15 +1262,34 @@ impl AccountDirectory {
         .execute(&mut *transaction)
         .await
         .map_err(|_| ServerError::Internal)?;
-        if result.rows_affected() == 0 {
-            return Err(ServerError::InvalidRequest);
+        if result.rows_affected() > 0 {
+            sqlx::query(
+                "UPDATE account_sessions SET revoked_at = now() \
+                 WHERE device_id = $1 AND account_id = $2 AND revoked_at IS NULL",
+            )
+            .bind(device_id)
+            .bind(account.account_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?;
         }
+        let event_id = Uuid::new_v4();
         sqlx::query(
-            "UPDATE account_sessions SET revoked_at = now() \
-             WHERE device_id = $1 AND account_id = $2 AND revoked_at IS NULL",
+            "INSERT INTO device_revocation_outbox \
+             (id, device_record_id, user_id, device_id) VALUES ($1, $2, $3, $4)",
         )
+        .bind(event_id)
         .bind(device_id)
-        .bind(account.account_id)
+        .bind(&address.user_id)
+        .bind(&address.device_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "INSERT INTO device_revocation_deliveries (event_id, instance_id) \
+             SELECT $1, instance_id FROM relay_instances WHERE fenced_at IS NULL",
+        )
+        .bind(event_id)
         .execute(&mut *transaction)
         .await
         .map_err(|_| ServerError::Internal)?;
@@ -1174,7 +1297,392 @@ impl AccountDirectory {
             .commit()
             .await
             .map_err(|_| ServerError::Internal)?;
-        Ok(address)
+        Ok((address, event_id))
+    }
+
+    pub(crate) async fn register_relay_instance(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(INSTANCE_REGISTRY_LOCK)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query("INSERT INTO relay_instances (instance_id) VALUES ($1)")
+            .bind(instance_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "INSERT INTO device_revocation_deliveries \
+             (event_id, instance_id, acknowledged_at) \
+             SELECT id, $1, now() FROM device_revocation_outbox",
+        )
+        .bind(instance_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn pending_revocations(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Vec<PendingRevocation>, ServerError> {
+        let active_instance: Option<Uuid> = sqlx::query_scalar(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL",
+        )
+        .bind(instance_id)
+        .fetch_optional(&self.inner.pool)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if active_instance.is_none() {
+            return Err(ServerError::Unavailable);
+        }
+        let rows = sqlx::query(
+            "SELECT o.id, o.user_id, o.device_id FROM device_revocation_deliveries d \
+             JOIN device_revocation_outbox o ON o.id = d.event_id \
+             WHERE d.instance_id = $1 AND d.acknowledged_at IS NULL \
+             ORDER BY o.created_at, o.id",
+        )
+        .bind(instance_id)
+        .fetch_all(&self.inner.pool)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingRevocation {
+                    event_id: row.try_get("id").map_err(|_| ServerError::Internal)?,
+                    address: DeviceAddress::new(
+                        row.try_get::<String, _>("user_id")
+                            .map_err(|_| ServerError::Internal)?,
+                        row.try_get::<String, _>("device_id")
+                            .map_err(|_| ServerError::Internal)?,
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn acknowledge_revocation(
+        &self,
+        instance_id: Uuid,
+        event_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let updated = sqlx::query(
+            "UPDATE device_revocation_deliveries SET acknowledged_at = COALESCE(acknowledged_at, now()) \
+             WHERE event_id = $1 AND instance_id = $2 AND EXISTS ( \
+               SELECT 1 FROM relay_instances WHERE instance_id = $2 AND fenced_at IS NULL \
+             )",
+        )
+        .bind(event_id)
+        .bind(instance_id)
+        .execute(&self.inner.pool)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if updated.rows_affected() != 1 {
+            return Err(ServerError::Unavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_revocation(&self, event_id: Uuid) -> Result<(), ServerError> {
+        loop {
+            let complete: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS ( \
+                   SELECT 1 FROM device_revocation_deliveries d \
+                   JOIN relay_instances i ON i.instance_id = d.instance_id \
+                   WHERE d.event_id = $1 AND d.acknowledged_at IS NULL \
+                     AND i.fenced_at IS NULL \
+                 )",
+            )
+            .bind(event_id)
+            .fetch_one(&self.inner.pool)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+            if complete {
+                return Ok(());
+            }
+            sleep(REVOCATION_POLL_INTERVAL).await;
+        }
+    }
+
+    pub(crate) async fn fence_relay_instance(&self, instance_id: Uuid) -> Result<(), ServerError> {
+        sqlx::query(
+            "UPDATE relay_instances SET fenced_at = now() \
+             WHERE instance_id = $1 AND fenced_at IS NULL",
+        )
+        .bind(instance_id)
+        .execute(&self.inner.pool)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        Ok(())
+    }
+
+    pub(crate) async fn authorize_relay_pair(
+        &self,
+        first: &DeviceAddress,
+        second: &DeviceAddress,
+        instance_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        let mut addresses = [first, second];
+        addresses.sort_by(|a, b| (&a.user_id, &a.device_id).cmp(&(&b.user_id, &b.device_id)));
+        let mut previous: Option<&DeviceAddress> = None;
+        for address in addresses {
+            if previous == Some(address) {
+                continue;
+            }
+            let row = sqlx::query(
+                "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+                 AND revoked_at IS NULL FOR SHARE",
+            )
+            .bind(&address.user_id)
+            .bind(&address.device_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?
+            .ok_or(ServerError::Unauthorized)?;
+            drop(row);
+            previous = Some(address);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn authorize_for_instance(
+        &self,
+        identity: IdentityPublicKey,
+        device: &DeviceAddress,
+        instance_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let instance = sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if instance.is_none() {
+            return Err(ServerError::Unavailable);
+        }
+        let active = sqlx::query(
+            "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND identity_public_key = $3 AND revoked_at IS NULL",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .bind(identity.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if active.is_none() {
+            return Err(ServerError::Unauthorized);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn issue_auth_challenge(
+        &self,
+        challenge_id: Uuid,
+        identity: IdentityPublicKey,
+        address: &DeviceAddress,
+        instance_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        let device_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND identity_public_key = $3 AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&address.user_id)
+        .bind(&address.device_id)
+        .bind(identity.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        sqlx::query("DELETE FROM relay_auth_challenges WHERE expires_at <= now()")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let pending_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM relay_auth_challenges \
+             WHERE instance_id = $1 AND consumed_at IS NULL AND expires_at > now()",
+        )
+        .bind(instance_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if pending_count >= MAX_PENDING_RELAY_CHALLENGES {
+            return Err(ServerError::ResourceLimit);
+        }
+        sqlx::query(
+            "INSERT INTO relay_auth_challenges \
+             (challenge_id, instance_id, device_record_id, expires_at) \
+             VALUES ($1, $2, $3, now() + interval '15 seconds')",
+        )
+        .bind(challenge_id)
+        .bind(instance_id)
+        .bind(device_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn consume_auth_challenge(
+        &self,
+        challenge_id: Uuid,
+        identity: IdentityPublicKey,
+        address: &DeviceAddress,
+        instance_id: Uuid,
+    ) -> Result<Transaction<'static, Postgres>, ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        let record = sqlx::query(
+            "SELECT c.device_record_id, d.identity_public_key \
+             FROM relay_auth_challenges c \
+             JOIN account_devices d ON d.id = c.device_record_id \
+             WHERE c.challenge_id = $1 AND c.instance_id = $2 \
+               AND c.consumed_at IS NULL AND c.expires_at > now() \
+               AND d.user_id = $3 AND d.device_id = $4 \
+               AND d.identity_public_key = $5 AND d.revoked_at IS NULL \
+             FOR UPDATE OF c, d",
+        )
+        .bind(challenge_id)
+        .bind(instance_id)
+        .bind(&address.user_id)
+        .bind(&address.device_id)
+        .bind(identity.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        let key: Vec<u8> = record
+            .try_get("identity_public_key")
+            .map_err(|_| ServerError::Internal)?;
+        if key.as_slice() != identity.as_bytes().as_slice() {
+            return Err(ServerError::Unauthorized);
+        }
+        let consumed = sqlx::query(
+            "UPDATE relay_auth_challenges SET consumed_at = now() \
+             WHERE challenge_id = $1 AND consumed_at IS NULL",
+        )
+        .bind(challenge_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if consumed.rows_affected() != 1 {
+            return Err(ServerError::Unauthorized);
+        }
+        Ok(transaction)
+    }
+
+    pub(crate) async fn authorize_recipient_for_instance(
+        &self,
+        device: &DeviceAddress,
+        instance_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let instance = sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if instance.is_none() {
+            return Err(ServerError::Unavailable);
+        }
+        let active = sqlx::query(
+            "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if active.is_none() {
+            return Err(ServerError::Unauthorized);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
     }
 
     pub(crate) async fn start_device_challenge(
@@ -1254,27 +1762,42 @@ impl AccountDirectory {
         {
             return Err(ServerError::Unauthorized);
         }
-        let result = sqlx::query(
-            "UPDATE account_sessions SET device_id = ( \
-                 SELECT id FROM account_devices WHERE account_id = $1 AND user_id = $2 \
-                   AND device_id = $3 AND identity_public_key = $4 AND revoked_at IS NULL \
-             ) WHERE token_hash = $5 AND account_id = $1 AND revoked_at IS NULL \
-               AND expires_at > now() AND EXISTS ( \
-                 SELECT 1 FROM account_devices WHERE account_id = $1 AND user_id = $2 \
-                   AND device_id = $3 AND identity_public_key = $4 AND revoked_at IS NULL \
-               )",
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let device_record: Uuid = sqlx::query_scalar(
+            "SELECT id FROM account_devices WHERE account_id = $1 AND user_id = $2 \
+             AND device_id = $3 AND identity_public_key = $4 AND revoked_at IS NULL FOR SHARE",
         )
         .bind(ceremony.account_id)
         .bind(&ceremony.device.user_id)
         .bind(&ceremony.device.device_id)
         .bind(ceremony.identity_key.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        let result = sqlx::query(
+            "UPDATE account_sessions SET device_id = $1 \
+             WHERE token_hash = $2 AND account_id = $3 AND revoked_at IS NULL \
+               AND expires_at > now()",
+        )
+        .bind(device_record)
         .bind(&account.session_hash)
-        .execute(&self.inner.pool)
+        .bind(ceremony.account_id)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| ServerError::Internal)?;
         if result.rows_affected() != 1 {
             return Err(ServerError::Unauthorized);
         }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)?;
         Ok(())
     }
 
@@ -1887,41 +2410,6 @@ impl AccountDirectory {
     }
 }
 
-#[async_trait]
-impl DeviceAuthorizer for AccountDirectory {
-    async fn authorize(
-        &self,
-        identity: IdentityPublicKey,
-        device: &DeviceAddress,
-    ) -> Result<(), ServerError> {
-        device.validate()?;
-        let row = sqlx::query(
-            "SELECT 1 FROM account_devices WHERE user_id = $1 AND device_id = $2 \
-             AND identity_public_key = $3 AND revoked_at IS NULL",
-        )
-        .bind(&device.user_id)
-        .bind(&device.device_id)
-        .bind(identity.as_bytes().as_slice())
-        .fetch_optional(&self.inner.pool)
-        .await
-        .map_err(|_| ServerError::Internal)?;
-        row.map(|_| ()).ok_or(ServerError::Unauthorized)
-    }
-
-    async fn authorize_recipient(&self, device: &DeviceAddress) -> Result<(), ServerError> {
-        device.validate()?;
-        let row = sqlx::query(
-            "SELECT 1 FROM account_devices WHERE user_id = $1 AND device_id = $2 AND revoked_at IS NULL",
-        )
-        .bind(&device.user_id)
-        .bind(&device.device_id)
-        .fetch_optional(&self.inner.pool)
-        .await
-        .map_err(|_| ServerError::Internal)?;
-        row.map(|_| ()).ok_or(ServerError::Unauthorized)
-    }
-}
-
 fn validate_tag(tag: &str) -> Result<String, ServerError> {
     const RESERVED: &[&str] = &[
         "abuse",
@@ -2029,7 +2517,7 @@ fn validate_display_name(name: &str) -> Result<String, ServerError> {
 }
 
 fn validate_browser_state(state: &str) -> Result<(), ServerError> {
-    decode_browser_secret(state)
+    decode_browser_secret(state).map(|_| ())
 }
 
 fn code_challenge_for_verifier(verifier: &str) -> Result<Vec<u8>, ServerError> {
@@ -2065,7 +2553,13 @@ fn validate_loopback_callback(callback_uri: &str) -> Result<String, ServerError>
     }
     let loopback = callback
         .host_str()
-        .and_then(|host| host.parse::<IpAddr>().ok())
+        .and_then(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host.parse::<IpAddr>().ok()
+        })
         .is_some_and(|address| address.is_loopback());
     if !loopback {
         return Err(ServerError::InvalidRequest);
@@ -2085,19 +2579,21 @@ fn make_callback_uri(callback_uri: &str, code: &str, state: &str) -> Result<Stri
 fn required_env(name: &'static str) -> Result<String, ServerError> {
     match env::var(name) {
         Ok(value) if !value.trim().is_empty() => Ok(value),
-        _ => Err(ServerError::InvalidConfiguration(name)),
-    }
-
-    fn env_u32(name: &'static str, default: u32) -> Result<u32, ServerError> {
-        match env::var(name) {
-            Ok(value) => value
-                .parse::<u32>()
-                .ok()
-                .filter(|value| *value > 0)
-                .ok_or(ServerError::InvalidConfiguration(name)),
-            Err(env::VarError::NotPresent) => Ok(default),
-            Err(env::VarError::NotUnicode(_)) => Err(ServerError::InvalidConfiguration(name)),
+        Ok(_) | Err(env::VarError::NotPresent | env::VarError::NotUnicode(_)) => {
+            Err(ServerError::InvalidConfiguration(name))
         }
+    }
+}
+
+fn env_u32(name: &'static str, default: u32) -> Result<u32, ServerError> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(ServerError::InvalidConfiguration(name)),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(ServerError::InvalidConfiguration(name)),
     }
 }
 
@@ -2171,6 +2667,8 @@ impl HasExpiry for FirstDeviceChallenge {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::{
         hash_token, normalize_tag, validate_email, validate_profile_update, validate_tag,
         AccountProfileUpdate,

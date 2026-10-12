@@ -20,7 +20,10 @@ use crate::{
     AppState, ClientFrame, DeviceAddress, ServerError, ServerFrame,
 };
 
+#[cfg(not(test))]
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(test)]
+const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(crate) async fn upgrade(
     State(state): State<AppState>,
@@ -34,17 +37,10 @@ pub(crate) async fn upgrade(
 }
 
 async fn serve_connection(socket: WebSocket, state: AppState) {
-    let (sink, mut stream, device) = match authenticate_socket(socket, &state).await {
+    let (sink, mut stream, device, handle) = match authenticate_socket(socket, &state).await {
         Ok(authenticated) => authenticated,
         Err(error) => {
             debug!(error = error.code(), "websocket authentication rejected");
-            return;
-        }
-    };
-    let handle = match state.connect(device.clone()).await {
-        Ok(handle) => handle,
-        Err(error) => {
-            debug!(error = error.code(), "websocket connection rejected");
             return;
         }
     };
@@ -193,7 +189,15 @@ type WebSocketStream = futures_util::stream::SplitStream<WebSocket>;
 async fn authenticate_socket(
     socket: WebSocket,
     state: &AppState,
-) -> Result<(WebSocketSink, WebSocketStream, DeviceAddress), ServerError> {
+) -> Result<
+    (
+        WebSocketSink,
+        WebSocketStream,
+        DeviceAddress,
+        crate::state::ConnectionHandle,
+    ),
+    ServerError,
+> {
     let (mut sink, mut stream) = socket.split();
     let start = read_auth_frame(&mut stream, state).await?;
     let AuthClientFrame::Start {
@@ -221,6 +225,13 @@ async fn authenticate_socket(
         nonce,
     )
     .map_err(|_| ServerError::Internal)?;
+    if let Err(error) = state
+        .register_auth_challenge(identity_key, &device, &challenge)
+        .await
+    {
+        send_auth_rejected(&mut sink, error).await;
+        return Err(ServerError::Unauthorized);
+    }
     send_auth_frame(
         &mut sink,
         &AuthServerFrame::Challenge {
@@ -239,24 +250,49 @@ async fn authenticate_socket(
         send_auth_rejected(&mut sink, ServerError::Unauthorized).await;
         return Err(ServerError::Unauthorized);
     };
-    if returned_id != challenge_id
-        || identity_key
-            .verify_device_auth_challenge(&challenge, &proof)
-            .is_err()
+    let authorization_guard = state.lock_device_authorization(&device).await;
+    let handle = match state
+        .connect_authenticated(
+            identity_key,
+            &device,
+            &challenge,
+            &returned_id,
+            &proof,
+            &authorization_guard,
+        )
+        .await
     {
-        send_auth_rejected(&mut sink, ServerError::Unauthorized).await;
-        return Err(ServerError::Unauthorized);
-    }
-    state.consume_auth_challenge(&challenge).await?;
-    send_auth_frame(
-        &mut sink,
-        &AuthServerFrame::Authenticated {
-            device: device.clone(),
-        },
-        state.config().max_websocket_frame_bytes,
+        Ok(handle) => handle,
+        Err(error) => {
+            drop(authorization_guard);
+            send_auth_rejected(&mut sink, error).await;
+            return Err(ServerError::Unauthorized);
+        }
+    };
+    let authenticated = time::timeout(
+        AUTHENTICATION_TIMEOUT,
+        send_auth_frame(
+            &mut sink,
+            &AuthServerFrame::Authenticated {
+                device: device.clone(),
+            },
+            state.config().max_websocket_frame_bytes,
+        ),
     )
-    .await?;
-    Ok((sink, stream, device))
+    .await;
+    let authenticated = match authenticated {
+        Ok(result) => result,
+        Err(_) => {
+            state.disconnect(&device, handle.id).await;
+            return Err(ServerError::Unauthorized);
+        }
+    };
+    if let Err(error) = authenticated {
+        state.disconnect(&device, handle.id).await;
+        return Err(error);
+    }
+    drop(authorization_guard);
+    Ok((sink, stream, device, handle))
 }
 
 async fn read_auth_frame(
@@ -320,6 +356,48 @@ async fn write_frames(
 ) {
     while let Some(frame) = receiver.recv().await {
         let result = match frame {
+            OutboundFrame::Protocol(ServerFrame::Deliver { envelope }) => {
+                let _guards = state
+                    .lock_devices_authorization(&envelope.sender, &envelope.recipient)
+                    .await;
+                if !state.is_ready()
+                    || !state.is_current_connection(device, connection_id).await
+                    || &envelope.recipient != device
+                {
+                    break;
+                }
+                match state
+                    .authorize_delivery(&envelope.sender, &envelope.recipient)
+                    .await
+                {
+                    Ok(()) => {
+                        let frame = ServerFrame::Deliver { envelope };
+                        match serde_json::to_string(&frame) {
+                            Ok(encoded)
+                                if encoded.len() <= state.config().max_websocket_frame_bytes =>
+                            {
+                                send_with_timeout(
+                                    &mut sink,
+                                    WsMessage::Text(encoded.into()),
+                                    write_timeout,
+                                )
+                                .await
+                            }
+                            _ => {
+                                let _ = send_with_timeout(
+                                    &mut sink,
+                                    WsMessage::Close(None),
+                                    write_timeout,
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+                    }
+                    Err(ServerError::Unauthorized) => Ok(()),
+                    Err(_) => break,
+                }
+            }
             OutboundFrame::Protocol(frame) => match serde_json::to_string(&frame) {
                 Ok(encoded) if encoded.len() <= state.config().max_websocket_frame_bytes => {
                     send_with_timeout(&mut sink, WsMessage::Text(encoded.into()), write_timeout)
@@ -366,9 +444,6 @@ async fn handle_client_frame(
 ) -> Result<(), ()> {
     match frame {
         ClientFrame::Send { to, payload } => {
-            if let Err(error) = state.authorize_recipient(&to).await {
-                return send_error(state, device, connection_id, error).await;
-            }
             match state.enqueue_from(device, connection_id, to, payload).await {
                 Ok(message_id) => state
                     .send_control(device, connection_id, ServerFrame::Accepted { message_id })
@@ -416,24 +491,85 @@ async fn send_error(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
 
     use aether_crypto::{DeviceAuthChallenge, Identity};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{json, Value};
-    use tokio::{net::TcpListener, time::timeout};
+    use tokio::{
+        net::TcpListener,
+        sync::Notify,
+        time::{sleep, timeout},
+    };
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{client::IntoClientRequest, Message as ClientMessage},
     };
 
     use crate::{
-        serve, AppState, AuthServerFrame, DeviceAddress, ServerConfig, StaticDeviceAuthorizer,
+        serve, AppState, AuthServerFrame, DeviceAddress, DeviceAuthorizer, ServerConfig,
+        ServerError, StaticDeviceAuthorizer,
     };
 
     type ClientSocket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
+
+    struct RevocableAuthorizer {
+        revoked: AtomicBool,
+        authorization_checks: AtomicUsize,
+        block_second_check: bool,
+        second_check_started: Notify,
+        release_second_check: Notify,
+    }
+
+    impl RevocableAuthorizer {
+        fn new(block_second_check: bool) -> Self {
+            Self {
+                revoked: AtomicBool::new(false),
+                authorization_checks: AtomicUsize::new(0),
+                block_second_check,
+                second_check_started: Notify::new(),
+                release_second_check: Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeviceAuthorizer for RevocableAuthorizer {
+        async fn authorize(
+            &self,
+            _identity: aether_crypto::IdentityPublicKey,
+            device: &DeviceAddress,
+        ) -> Result<(), ServerError> {
+            if device != &DeviceAddress::new("alice", "phone")? {
+                return Err(ServerError::Unauthorized);
+            }
+            let check = self.authorization_checks.fetch_add(1, Ordering::AcqRel) + 1;
+            if check == 2 && self.block_second_check {
+                self.second_check_started.notify_one();
+                self.release_second_check.notified().await;
+            }
+            if self.revoked.load(Ordering::Acquire) {
+                Err(ServerError::Unauthorized)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn authorize_recipient(&self, device: &DeviceAddress) -> Result<(), ServerError> {
+            if device == &DeviceAddress::new("alice", "phone")?
+                && !self.revoked.load(Ordering::Acquire)
+            {
+                Ok(())
+            } else {
+                Err(ServerError::Unauthorized)
+            }
+        }
+    }
 
     async fn connect_socket(address: std::net::SocketAddr) -> ClientSocket {
         let request = format!("ws://{address}/ws")
@@ -455,6 +591,52 @@ mod tests {
             ClientMessage::Text(text) => serde_json::from_str(&text).expect("valid server JSON"),
             other => panic!("unexpected websocket frame: {other:?}"),
         }
+    }
+
+    async fn start_authentication(
+        socket: &mut ClientSocket,
+        identity: &Identity,
+    ) -> DeviceAuthChallenge {
+        socket
+            .send(ClientMessage::Text(
+                json!({
+                    "type": "start",
+                    "device": { "user_id": "alice", "device_id": "phone" },
+                    "identity_key": identity.public_key()
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send auth start");
+        let frame: AuthServerFrame =
+            serde_json::from_value(read_json(socket).await).expect("decode auth challenge");
+        let AuthServerFrame::Challenge { challenge } = frame else {
+            panic!("expected auth challenge");
+        };
+        challenge
+    }
+
+    async fn submit_proof(
+        socket: &mut ClientSocket,
+        identity: &Identity,
+        challenge: &DeviceAuthChallenge,
+    ) {
+        let proof = identity
+            .sign_device_auth_challenge(challenge)
+            .expect("sign server challenge");
+        socket
+            .send(ClientMessage::Text(
+                json!({
+                    "type": "proof",
+                    "challenge_id": challenge.challenge_id(),
+                    "proof": proof
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send auth proof");
     }
 
     async fn authenticate(
@@ -692,6 +874,278 @@ mod tests {
             .unwrap();
         let rejected = read_json(&mut invalid).await;
         assert_eq!(rejected["type"], "rejected");
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn challenge_expires_when_client_does_not_prove_key_possession() {
+        let identity = Identity::from_secret_bytes(&[33; 32]).unwrap();
+        let device = DeviceAddress::new("alice", "phone").unwrap();
+        let mut authorizer = StaticDeviceAuthorizer::new();
+        authorizer.insert(device, identity.public_key()).unwrap();
+        let state = AppState::new(ServerConfig::default(), Arc::new(authorizer)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve(listener, server_state, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let mut socket = connect_socket(address).await;
+        socket
+            .send(ClientMessage::Text(
+                json!({
+                    "type": "start",
+                    "device": { "user_id": "alice", "device_id": "phone" },
+                    "identity_key": identity.public_key()
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read_json(&mut socket).await["type"], "challenge");
+        let closed = timeout(std::time::Duration::from_secs(3), socket.next())
+            .await
+            .expect("expired authentication closes the socket");
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+        ));
+        assert_eq!(state.queued_messages().await, 0);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_send_frame_before_authentication_is_rejected_without_routing() {
+        let identity = Identity::from_secret_bytes(&[34; 32]).unwrap();
+        let device = DeviceAddress::new("alice", "phone").unwrap();
+        let mut authorizer = StaticDeviceAuthorizer::new();
+        authorizer.insert(device, identity.public_key()).unwrap();
+        let state = AppState::new(ServerConfig::default(), Arc::new(authorizer)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve(listener, server_state, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let mut socket = connect_socket(address).await;
+        socket
+            .send(ClientMessage::Text(
+                json!({
+                    "type": "start",
+                    "device": { "user_id": "alice", "device_id": "phone" },
+                    "identity_key": identity.public_key()
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read_json(&mut socket).await["type"], "challenge");
+        socket
+            .send(ClientMessage::Text(
+                json!({
+                    "type": "send",
+                    "to": { "user_id": "bob", "device_id": "phone" },
+                    "payload": [1, 2, 3]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let closed = timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("unauthenticated send closes the socket");
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+        ));
+        assert_eq!(state.queued_messages().await, 0);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revocation_after_challenge_issuance_rejects_the_proof() {
+        let identity = Identity::from_secret_bytes(&[35; 32]).unwrap();
+        let authorizer = Arc::new(RevocableAuthorizer::new(false));
+        let state = AppState::new(ServerConfig::default(), authorizer.clone()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve(listener, server_state, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let mut socket = connect_socket(address).await;
+        let challenge = start_authentication(&mut socket, &identity).await;
+        authorizer.revoked.store(true, Ordering::Release);
+        submit_proof(&mut socket, &identity, &challenge).await;
+        assert_eq!(read_json(&mut socket).await["type"], "rejected");
+        let _ = socket
+            .send(ClientMessage::Text(
+                json!({
+                    "type": "send",
+                    "to": { "user_id": "bob", "device_id": "phone" },
+                    "payload": [1, 2, 3]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        assert_eq!(state.queued_messages().await, 0);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revocation_racing_with_authentication_is_ordered_by_device_guard() {
+        let identity = Identity::from_secret_bytes(&[36; 32]).unwrap();
+        let device = DeviceAddress::new("alice", "phone").unwrap();
+        let authorizer = Arc::new(RevocableAuthorizer::new(true));
+        let state = AppState::new(ServerConfig::default(), authorizer.clone()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve(listener, server_state, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let mut socket = connect_socket(address).await;
+        let challenge = start_authentication(&mut socket, &identity).await;
+        submit_proof(&mut socket, &identity, &challenge).await;
+        timeout(
+            std::time::Duration::from_secs(2),
+            authorizer.second_check_started.notified(),
+        )
+        .await
+        .expect("proof revalidation started while holding device guard");
+
+        let revocation_started = Arc::new(Notify::new());
+        let revocation_state = state.clone();
+        let revocation_device = device.clone();
+        let revocation_authorizer = authorizer.clone();
+        let revocation_started_signal = revocation_started.clone();
+        let revocation = tokio::spawn(async move {
+            revocation_started_signal.notify_one();
+            let guard = revocation_state
+                .lock_device_authorization(&revocation_device)
+                .await;
+            revocation_authorizer.revoked.store(true, Ordering::Release);
+            revocation_state
+                .revoke_route_device(&revocation_device, guard)
+                .await
+                .expect("remove revoked route");
+        });
+        timeout(
+            std::time::Duration::from_secs(2),
+            revocation_started.notified(),
+        )
+        .await
+        .expect("revocation started");
+        sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !revocation.is_finished(),
+            "revocation waits for in-flight auth"
+        );
+
+        authorizer.release_second_check.notify_one();
+        assert_eq!(read_json(&mut socket).await["type"], "authenticated");
+        timeout(std::time::Duration::from_secs(2), revocation)
+            .await
+            .expect("revocation completes after auth linearizes")
+            .expect("revocation task succeeds");
+        let closed = timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("revoked socket closes");
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_)))
+        ));
+        assert_eq!(state.queued_messages().await, 0);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replayed_proof_from_a_previous_connection_is_rejected() {
+        let identity = Identity::from_secret_bytes(&[37; 32]).unwrap();
+        let device = DeviceAddress::new("alice", "phone").unwrap();
+        let mut authorizer = StaticDeviceAuthorizer::new();
+        authorizer.insert(device, identity.public_key()).unwrap();
+        let state = AppState::new(ServerConfig::default(), Arc::new(authorizer)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve(listener, server_state, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let mut first = connect_socket(address).await;
+        let first_challenge = start_authentication(&mut first, &identity).await;
+        submit_proof(&mut first, &identity, &first_challenge).await;
+        assert_eq!(read_json(&mut first).await["type"], "authenticated");
+        submit_proof(&mut first, &identity, &first_challenge).await;
+        assert_eq!(read_json(&mut first).await["type"], "error");
+
+        let mut replay = connect_socket(address).await;
+        let second_challenge = start_authentication(&mut replay, &identity).await;
+        let old_proof = identity
+            .sign_device_auth_challenge(&first_challenge)
+            .unwrap();
+        replay
+            .send(ClientMessage::Text(
+                json!({
+                    "type": "proof",
+                    "challenge_id": first_challenge.challenge_id(),
+                    "proof": old_proof
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            first_challenge.challenge_id(),
+            second_challenge.challenge_id()
+        );
+        assert_eq!(read_json(&mut replay).await["type"], "rejected");
+        assert_eq!(state.queued_messages().await, 0);
+
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
