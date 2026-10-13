@@ -1,8 +1,9 @@
 # aether-server
 
-`aether-server` provides the Void account directory and an asynchronous,
-in-memory WebSocket relay for Aether ciphertext envelopes. PostgreSQL is the
-authoritative account/device directory. The binary defaults to production
+`aether-server` provides the Void account directory and an asynchronous
+WebSocket relay for Aether ciphertext envelopes. PostgreSQL is the authoritative
+account/device directory and stores opaque encrypted DM envelopes for persistent
+history. The binary defaults to production
 mode and refuses to start unless `DATABASE_URL` is configured and reachable.
 The static device allowlist is available only when
 `AETHER_ENV=development` is explicitly set; account endpoints are unavailable
@@ -29,12 +30,18 @@ is not production-ready.
 - `OpaqueEnvelope` contains a server message ID, sender and recipient device
   addresses, and opaque payload bytes. The server sees routing metadata and
   payload length, but treats payload contents as arbitrary bytes.
-- `AppState` serializes mailbox and connection bookkeeping under an async
-  mutex. Online sends are pushed to the recipient connection; offline messages
-  remain in a bounded in-memory mailbox until an authenticated recipient ACK.
-- Queues are process-local and are lost on restart. Delivery is at-least-once:
-  an unacknowledged envelope is retried after reconnect, so clients should
-  deduplicate using `message_id`.
+- `AppState` serializes local connection bookkeeping under an async mutex.
+  Production sends are persisted as opaque ciphertext before they are accepted.
+  A PostgreSQL delivery lease assigns each pending message to one server
+  instance at a time; the worker submits one message per recipient per poll,
+  ordered by the durable relay sequence so a ratchet stream is not reordered.
+- A recipient ACK commits `delivered_at` only after the client has durably
+  saved its encrypted ratchet snapshot and local event history. Unacknowledged
+  rows are reclaimed after the 30-second lease expires, and graceful disconnect
+  or shutdown releases leases sooner. Delivery is at-least-once; clients
+  deduplicate by message ID. Persistent clients provide a stable message ID so
+  retrying an interrupted send cannot create a second relay envelope.
+- Non-durable development mode retains its bounded process-local mailbox.
 - PostgreSQL-backed relay instances register before serving. Authentication,
   relay ingress, and each delivery write check the instance and active device
   records in PostgreSQL. Device revocation commits an outbox event and per-
@@ -80,8 +87,9 @@ is not production-ready.
 
 ### Multi-instance revocation operations
 
-Apply migrations through `0006_signup_rate_limits.sql` before
-deploying this version. All instances must use the same PostgreSQL database
+The database schema must be migrated through
+`0009_reliable_dm_synchronization.sql` before deploying this version. All
+instances must use the same PostgreSQL database
 and a consistent schema. For the first rollout, drain and confirm shutdown of
 every pre-coordination server before enabling revocation on this version;
 older processes are not present in the instance registry and cannot be
@@ -98,11 +106,24 @@ request can be retried after coordination recovers.
 The PostgreSQL integration tests require `TEST_DATABASE_URL` to
 point to a disposable PostgreSQL database where the test role can create and
 drop schemas. Without that variable these tests skip; the regular unit tests
-do not substitute for this database-backed coverage.
+do not substitute for database-backed migration, message persistence,
+authorization, deletion, and read-receipt coverage.
 
-The relay remains an opaque ciphertext-envelope router. PostgreSQL coordination
-stores only routing/device metadata and revocation event status; it does not
-read or transform payload bytes or participate in Noise/ratchet sessions.
+The relay remains an opaque ciphertext-envelope router. PostgreSQL stores
+ciphertext payload bytes, routing/order metadata, and delivery/read/delete
+state; it does not read or transform payload bytes or participate in
+Noise/ratchet sessions. Message edits, reactions, and reply references are
+encrypted client-side and relayed as additional opaque envelopes. Deletion and
+read receipts update server metadata only. History is retained until an
+operator removes it from PostgreSQL; configure database backups and capacity
+accordingly. Migrations are applied automatically at startup by the configured
+database role. For deployment, back up the database, grant the service role
+the migration DDL rights it needs, then start the updated server against the
+existing database with `DATABASE_URL`; startup applies any pending migrations
+before serving. Verify `/readyz` and inspect migration logs before routing
+traffic. `DATABASE_URL` must point at the service database; use a separate
+disposable database with `TEST_DATABASE_URL` for tests, never the production
+database.
 
 ## WebSocket protocol
 
@@ -464,8 +485,9 @@ cargo test --workspace
 
 Pure account-validation and relay tests need no production secrets. Set
 `TEST_DATABASE_URL` to an isolated disposable PostgreSQL database to execute
-the migration, enrollment/approval/persistence, and two-instance revocation
-integration tests. These tests create and drop per-test schemas.
+the migration, account/device enrollment, encrypted DM history/persistence,
+authorization/deletion/read-receipt, and two-instance revocation integration
+tests. These tests create and drop per-test schemas.
 
 ## Docker / Northflank
 
@@ -498,11 +520,16 @@ Configure the platform's health check at `/healthz` and readiness probe at
   one database-wide rate counter (30 per minute), not per source IP.
 - Device-auth proof alone does not protect transport confidentiality or
   authenticate the relay to the client; deploy TLS and use `wss://`.
-- Offline storage is bounded but volatile, single-process memory. There is no
-  persistence, replication, multi-node routing, or cross-region delivery.
-- No rate limiting, abuse/moderation controls, durable idempotency, sender
-  retries, delivery receipts beyond recipient ACK, or attachment storage.
-- The application must determine device identity, TLS ingress, retry policy,
-  mailbox retention, and deduplicate repeated deliveries by server message ID.
-- Adding durable queues or distributed routing will require defining the
-  desired delivery and transaction guarantees first.
+- PostgreSQL provides durable ciphertext envelopes and cross-instance relay
+  delivery, but there is no cross-region replication or automatic retention.
+  Configure backups, capacity limits, and an operator-managed retention
+  policy; history remains stored until explicitly deleted or the database
+  retention policy removes it.
+- Delivery is at-least-once. Clients must retain their encrypted local ratchet
+  snapshot and deduplicate messages by stable message ID. A fresh device does
+  not gain the keys needed to decrypt historical envelopes; there is no secure
+  history-transfer protocol.
+- Typing status is relayed across instances from short-lived PostgreSQL state
+  (five-second expiry); it remains best-effort, and clients clear it on timeout
+  or connection loss. Abuse controls, attachment storage, and cross-region
+  delivery are not implemented.

@@ -21,7 +21,7 @@ use webauthn_rs::prelude::{
     WebauthnBuilder,
 };
 
-use crate::{DeviceAddress, ServerError};
+use crate::{protocol::StoredRelayMessage, DeviceAddress, OpaqueEnvelope, ServerError};
 
 const EMAIL_TOKEN_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 const PASSKEY_CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
@@ -36,6 +36,13 @@ const REVOCATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct PendingRevocation {
     pub event_id: Uuid,
     pub address: DeviceAddress,
+}
+
+pub(crate) struct TypingState {
+    pub sender: DeviceAddress,
+    pub recipient: DeviceAddress,
+    pub is_typing: bool,
+    pub updated_at: String,
 }
 
 #[derive(Clone)]
@@ -1453,15 +1460,32 @@ impl AccountDirectory {
     }
 
     pub(crate) async fn fence_relay_instance(&self, instance_id: Uuid) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
         sqlx::query(
             "UPDATE relay_instances SET fenced_at = now() \
              WHERE instance_id = $1 AND fenced_at IS NULL",
         )
         .bind(instance_id)
-        .execute(&self.inner.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| ServerError::Internal)?;
-        Ok(())
+        sqlx::query(
+            "UPDATE relay_messages SET delivery_lease_expires_at = now() \
+             WHERE delivery_lease_instance = $1 AND delivered_at IS NULL",
+        )
+        .bind(instance_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
     }
 
     pub(crate) async fn authorize_relay_pair(
@@ -1509,6 +1533,726 @@ impl AccountDirectory {
             .commit()
             .await
             .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn persist_relay_message(
+        &self,
+        instance_id: Uuid,
+        envelope: &OpaqueEnvelope,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        let mut addresses = [&envelope.sender, &envelope.recipient];
+        addresses.sort_by(|a, b| (&a.user_id, &a.device_id).cmp(&(&b.user_id, &b.device_id)));
+        for address in addresses {
+            sqlx::query(
+                "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+                 AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+            )
+            .bind(&address.user_id)
+            .bind(&address.device_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?
+            .ok_or(ServerError::Unauthorized)?;
+        }
+        sqlx::query(
+            "INSERT INTO relay_messages \
+             (message_id, sender_user_id, sender_device_id, recipient_user_id, \
+              recipient_device_id, payload) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (message_id) DO NOTHING",
+        )
+        .bind(envelope.message_id)
+        .bind(&envelope.sender.user_id)
+        .bind(&envelope.sender.device_id)
+        .bind(&envelope.recipient.user_id)
+        .bind(&envelope.recipient.device_id)
+        .bind(&envelope.payload)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        let existing_matches: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM relay_messages WHERE message_id = $1 \
+             AND sender_user_id = $2 AND sender_device_id = $3 \
+             AND recipient_user_id = $4 AND recipient_device_id = $5 AND payload = $6)",
+        )
+        .bind(envelope.message_id)
+        .bind(&envelope.sender.user_id)
+        .bind(&envelope.sender.device_id)
+        .bind(&envelope.recipient.user_id)
+        .bind(&envelope.recipient.device_id)
+        .bind(&envelope.payload)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if !existing_matches {
+            return Err(ServerError::InvalidRequest);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn claim_pending_relay_messages(
+        &self,
+        instance_id: Uuid,
+        device: &DeviceAddress,
+        limit: u16,
+    ) -> Result<Vec<OpaqueEnvelope>, ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        sqlx::query(
+            "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        let rows = sqlx::query(
+            "WITH pending AS ( \
+               SELECT message_id FROM relay_messages \
+               WHERE recipient_user_id = $1 AND recipient_device_id = $2 \
+                 AND delivered_at IS NULL AND deleted_at IS NULL \
+                 AND (delivery_lease_expires_at IS NULL \
+                   OR delivery_lease_expires_at <= now()) \
+                 AND NOT EXISTS (SELECT 1 FROM relay_message_hides h \
+                   JOIN account_devices recipient ON recipient.user_id = $1 \
+                     AND recipient.device_id = $2 \
+                   WHERE h.account_id = recipient.account_id \
+                     AND h.message_id = relay_messages.message_id) \
+               ORDER BY relay_sequence \
+               FOR UPDATE SKIP LOCKED LIMIT $3 \
+             ) \
+             UPDATE relay_messages m \
+             SET delivery_lease_instance = $4, \
+                 delivery_lease_expires_at = now() + interval '30 seconds', \
+                 delivery_attempts = delivery_attempts + 1 \
+             FROM pending \
+             WHERE m.message_id = pending.message_id \
+             RETURNING m.message_id, m.sender_user_id, m.sender_device_id, \
+                       m.recipient_user_id, m.recipient_device_id, m.payload",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .bind(i64::from(limit))
+        .bind(instance_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(OpaqueEnvelope {
+                    message_id: row
+                        .try_get("message_id")
+                        .map_err(|_| ServerError::Internal)?,
+                    sender: DeviceAddress::new(
+                        row.try_get::<String, _>("sender_user_id")
+                            .map_err(|_| ServerError::Internal)?,
+                        row.try_get::<String, _>("sender_device_id")
+                            .map_err(|_| ServerError::Internal)?,
+                    )?,
+                    recipient: DeviceAddress::new(
+                        row.try_get::<String, _>("recipient_user_id")
+                            .map_err(|_| ServerError::Internal)?,
+                        row.try_get::<String, _>("recipient_device_id")
+                            .map_err(|_| ServerError::Internal)?,
+                    )?,
+                    payload: row.try_get("payload").map_err(|_| ServerError::Internal)?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn acknowledge_relay_message(
+        &self,
+        instance_id: Uuid,
+        device: &DeviceAddress,
+        message_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        sqlx::query(
+            "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        let updated = sqlx::query(
+            "UPDATE relay_messages SET delivered_at = now(), \
+                 delivery_lease_instance = NULL, delivery_lease_expires_at = NULL \
+             WHERE message_id = $1 AND recipient_user_id = $2 \
+               AND recipient_device_id = $3 AND delivered_at IS NULL \
+               AND delivery_lease_instance = $4",
+        )
+        .bind(message_id)
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .bind(instance_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if updated.rows_affected() == 0 {
+            let already_acked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM relay_messages WHERE message_id = $1 \
+                 AND recipient_user_id = $2 AND recipient_device_id = $3 \
+                 AND delivered_at IS NOT NULL)",
+            )
+            .bind(message_id)
+            .bind(&device.user_id)
+            .bind(&device.device_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+            if !already_acked {
+                return Err(ServerError::InvalidAcknowledgement);
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn record_typing_state(
+        &self,
+        instance_id: Uuid,
+        sender: &DeviceAddress,
+        recipient: &DeviceAddress,
+        is_typing: bool,
+    ) -> Result<(), ServerError> {
+        if sender == recipient {
+            return Err(ServerError::InvalidRequest);
+        }
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        let mut addresses = [sender, recipient];
+        addresses.sort_by(|a, b| (&a.user_id, &a.device_id).cmp(&(&b.user_id, &b.device_id)));
+        for address in addresses {
+            sqlx::query(
+                "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+                 AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+            )
+            .bind(&address.user_id)
+            .bind(&address.device_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?
+            .ok_or(ServerError::Unauthorized)?;
+        }
+        sqlx::query(
+            "INSERT INTO relay_typing_states \
+             (sender_user_id, sender_device_id, recipient_user_id, recipient_device_id, \
+              is_typing, updated_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, now(), now() + interval '5 seconds') \
+             ON CONFLICT (sender_user_id, sender_device_id, recipient_user_id, recipient_device_id) \
+             DO UPDATE SET is_typing = EXCLUDED.is_typing, updated_at = EXCLUDED.updated_at, \
+                           expires_at = EXCLUDED.expires_at",
+        )
+        .bind(&sender.user_id)
+        .bind(&sender.device_id)
+        .bind(&recipient.user_id)
+        .bind(&recipient.device_id)
+        .bind(is_typing)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn active_typing_states(
+        &self,
+        instance_id: Uuid,
+        connected_devices: &[DeviceAddress],
+    ) -> Result<Vec<TypingState>, ServerError> {
+        if connected_devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        sqlx::query("DELETE FROM relay_typing_states WHERE expires_at <= now()")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let recipient_users: Vec<_> = connected_devices
+            .iter()
+            .map(|device| device.user_id.clone())
+            .collect();
+        let recipient_devices: Vec<_> = connected_devices
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect();
+        let rows = sqlx::query(
+            "SELECT s.sender_user_id, s.sender_device_id, \
+                    s.recipient_user_id, s.recipient_device_id, s.is_typing, \
+                    s.updated_at::text AS updated_at \
+             FROM relay_typing_states s \
+             JOIN account_devices sender ON sender.user_id = s.sender_user_id \
+               AND sender.device_id = s.sender_device_id \
+               AND sender.registration_status = 'active' AND sender.revoked_at IS NULL \
+             JOIN account_devices recipient ON recipient.user_id = s.recipient_user_id \
+               AND recipient.device_id = s.recipient_device_id \
+               AND recipient.registration_status = 'active' AND recipient.revoked_at IS NULL \
+             JOIN unnest($2::text[], $3::text[]) AS connected(user_id, device_id) \
+               ON connected.user_id = s.recipient_user_id \
+               AND connected.device_id = s.recipient_device_id \
+             WHERE s.expires_at > now() AND EXISTS (SELECT 1 FROM relay_instances \
+               WHERE instance_id = $1 AND fenced_at IS NULL) \
+             ORDER BY s.updated_at",
+        )
+        .bind(instance_id)
+        .bind(recipient_users)
+        .bind(recipient_devices)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TypingState {
+                    sender: DeviceAddress::new(
+                        row.try_get::<String, _>("sender_user_id")
+                            .map_err(|_| ServerError::Internal)?,
+                        row.try_get::<String, _>("sender_device_id")
+                            .map_err(|_| ServerError::Internal)?,
+                    )?,
+                    recipient: DeviceAddress::new(
+                        row.try_get::<String, _>("recipient_user_id")
+                            .map_err(|_| ServerError::Internal)?,
+                        row.try_get::<String, _>("recipient_device_id")
+                            .map_err(|_| ServerError::Internal)?,
+                    )?,
+                    is_typing: row
+                        .try_get("is_typing")
+                        .map_err(|_| ServerError::Internal)?,
+                    updated_at: row
+                        .try_get("updated_at")
+                        .map_err(|_| ServerError::Internal)?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn release_relay_delivery_leases(
+        &self,
+        instance_id: Uuid,
+        device: Option<&DeviceAddress>,
+    ) -> Result<(), ServerError> {
+        let result = if let Some(device) = device {
+            sqlx::query(
+                "UPDATE relay_messages SET delivery_lease_expires_at = now() \
+                 WHERE delivery_lease_instance = $1 AND recipient_user_id = $2 \
+                   AND recipient_device_id = $3 AND delivered_at IS NULL",
+            )
+            .bind(instance_id)
+            .bind(&device.user_id)
+            .bind(&device.device_id)
+            .execute(&self.inner.pool)
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE relay_messages SET delivery_lease_expires_at = now() \
+                 WHERE delivery_lease_instance = $1 AND delivered_at IS NULL",
+            )
+            .bind(instance_id)
+            .execute(&self.inner.pool)
+            .await
+        };
+        result.map(|_| ()).map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn relay_history(
+        &self,
+        instance_id: Uuid,
+        device: &DeviceAddress,
+        with: &DeviceAddress,
+        before: Option<Uuid>,
+        limit: u16,
+    ) -> Result<(Vec<StoredRelayMessage>, bool), ServerError> {
+        if limit == 0 || limit > 100 || device == with {
+            return Err(ServerError::InvalidRequest);
+        }
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        let mut addresses = [device, with];
+        addresses.sort_by(|a, b| (&a.user_id, &a.device_id).cmp(&(&b.user_id, &b.device_id)));
+        for address in addresses {
+            sqlx::query(
+                "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+                 AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+            )
+            .bind(&address.user_id)
+            .bind(&address.device_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?
+            .ok_or(ServerError::Unauthorized)?;
+        }
+        let rows = sqlx::query(
+            "SELECT m.message_id, m.sender_user_id, m.sender_device_id, \
+                    m.recipient_user_id, m.recipient_device_id, m.payload, \
+                    m.deleted_at IS NOT NULL AS deleted, \
+                    (SELECT to_char(MAX(r.read_at) AT TIME ZONE 'UTC', \
+                      'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+                     FROM relay_message_read_receipts r \
+                     WHERE r.message_id = m.message_id) AS read_at, \
+                    EXISTS (SELECT 1 FROM relay_message_hides h \
+                      WHERE h.account_id = d.account_id AND h.message_id = m.message_id) \
+                      AS hidden, \
+                    to_char(m.created_at AT TIME ZONE 'UTC', \
+                      'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
+             FROM relay_messages m \
+             JOIN account_devices d ON d.user_id = $1 AND d.device_id = $2 \
+               AND d.registration_status = 'active' AND d.revoked_at IS NULL \
+             WHERE ((m.sender_user_id = $1 AND m.sender_device_id = $2 \
+                       AND m.recipient_user_id = $3 AND m.recipient_device_id = $4) \
+                 OR (m.sender_user_id = $3 AND m.sender_device_id = $4 \
+                       AND m.recipient_user_id = $1 AND m.recipient_device_id = $2)) \
+               AND ($5::uuid IS NULL OR m.relay_sequence < \
+                 (SELECT cursor.relay_sequence FROM relay_messages cursor \
+                  WHERE cursor.message_id = $5 AND \
+                    ((cursor.sender_user_id = $1 AND cursor.sender_device_id = $2 \
+                      AND cursor.recipient_user_id = $3 AND cursor.recipient_device_id = $4) \
+                     OR (cursor.sender_user_id = $3 AND cursor.sender_device_id = $4 \
+                      AND cursor.recipient_user_id = $1 AND cursor.recipient_device_id = $2))) \
+             ORDER BY m.relay_sequence DESC LIMIT $6",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .bind(&with.user_id)
+        .bind(&with.device_id)
+        .bind(before)
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let has_more = rows.len() > usize::from(limit);
+        let messages = rows
+            .into_iter()
+            .take(usize::from(limit))
+            .map(|row| {
+                let deleted: bool = row.try_get("deleted").map_err(|_| ServerError::Internal)?;
+                let envelope = OpaqueEnvelope {
+                    message_id: row
+                        .try_get("message_id")
+                        .map_err(|_| ServerError::Internal)?,
+                    sender: DeviceAddress::new(
+                        row.try_get::<String, _>("sender_user_id")
+                            .map_err(|_| ServerError::Internal)?,
+                        row.try_get::<String, _>("sender_device_id")
+                            .map_err(|_| ServerError::Internal)?,
+                    )?,
+                    recipient: DeviceAddress::new(
+                        row.try_get::<String, _>("recipient_user_id")
+                            .map_err(|_| ServerError::Internal)?,
+                        row.try_get::<String, _>("recipient_device_id")
+                            .map_err(|_| ServerError::Internal)?,
+                    )?,
+                    payload: row.try_get("payload").map_err(|_| ServerError::Internal)?,
+                };
+                Ok(StoredRelayMessage {
+                    envelope,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|_| ServerError::Internal)?,
+                    deleted,
+                    hidden: row.try_get("hidden").map_err(|_| ServerError::Internal)?,
+                    read_at: row.try_get("read_at").map_err(|_| ServerError::Internal)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ServerError>>()?;
+        Ok((messages, has_more))
+    }
+
+    pub(crate) async fn hide_relay_message(
+        &self,
+        instance_id: Uuid,
+        device: &DeviceAddress,
+        message_id: Uuid,
+    ) -> Result<(), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        let account_id: Uuid = sqlx::query_scalar(
+            "SELECT account_id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        let message = sqlx::query(
+            "SELECT message_id FROM relay_messages WHERE message_id = $1 \
+             AND ((sender_user_id = $2 AND sender_device_id = $3) \
+               OR (recipient_user_id = $2 AND recipient_device_id = $3)) FOR UPDATE",
+        )
+        .bind(message_id)
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        if message.is_none() {
+            return Err(ServerError::InvalidRequest);
+        }
+        sqlx::query(
+            "INSERT INTO relay_message_hides (account_id, message_id) \
+             VALUES ($1, $2) ON CONFLICT (account_id, message_id) DO NOTHING",
+        )
+        .bind(account_id)
+        .bind(message_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)
+    }
+
+    pub(crate) async fn redact_relay_message(
+        &self,
+        instance_id: Uuid,
+        device: &DeviceAddress,
+        message_id: Uuid,
+    ) -> Result<DeviceAddress, ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        sqlx::query(
+            "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        let row = sqlx::query(
+            "UPDATE relay_messages SET deleted_at = COALESCE(deleted_at, now()), payload = decode('', 'hex') \
+             WHERE message_id = $1 AND sender_user_id = $2 AND sender_device_id = $3 \
+             RETURNING recipient_user_id, recipient_device_id",
+        )
+        .bind(message_id)
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::InvalidRequest)?;
+        let recipient = DeviceAddress::new(
+            row.try_get::<String, _>("recipient_user_id")
+                .map_err(|_| ServerError::Internal)?,
+            row.try_get::<String, _>("recipient_device_id")
+                .map_err(|_| ServerError::Internal)?,
+        )?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        Ok(recipient)
+    }
+
+    pub(crate) async fn record_read_receipt(
+        &self,
+        instance_id: Uuid,
+        device: &DeviceAddress,
+        message_id: Uuid,
+    ) -> Result<(DeviceAddress, String), ServerError> {
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        sqlx::query(
+            "SELECT instance_id FROM relay_instances \
+             WHERE instance_id = $1 AND fenced_at IS NULL FOR SHARE",
+        )
+        .bind(instance_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unavailable)?;
+        sqlx::query(
+            "SELECT id FROM account_devices WHERE user_id = $1 AND device_id = $2 \
+             AND registration_status = 'active' AND revoked_at IS NULL FOR SHARE",
+        )
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::Unauthorized)?;
+        let row = sqlx::query(
+            "INSERT INTO relay_message_read_receipts (message_id, reader_device_id) \
+             SELECT m.message_id, d.id FROM relay_messages m \
+             JOIN account_devices d ON d.user_id = $2 AND d.device_id = $3 \
+               AND d.registration_status = 'active' AND d.revoked_at IS NULL \
+             WHERE m.message_id = $1 AND m.recipient_user_id = $2 \
+               AND m.recipient_device_id = $3 AND m.deleted_at IS NULL \
+             ON CONFLICT (message_id, reader_device_id) DO UPDATE \
+               SET read_at = relay_message_read_receipts.read_at \
+             RETURNING to_char(read_at AT TIME ZONE 'UTC', \
+               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS read_at",
+        )
+        .bind(message_id)
+        .bind(&device.user_id)
+        .bind(&device.device_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::InvalidRequest)?;
+        let sender = sqlx::query(
+            "SELECT sender_user_id, sender_device_id FROM relay_messages WHERE message_id = $1",
+        )
+        .bind(message_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?
+        .ok_or(ServerError::InvalidRequest)?;
+        let sender = (
+            DeviceAddress::new(
+                sender
+                    .try_get::<String, _>("sender_user_id")
+                    .map_err(|_| ServerError::Internal)?,
+                sender
+                    .try_get::<String, _>("sender_device_id")
+                    .map_err(|_| ServerError::Internal)?,
+            )?,
+            row.try_get("read_at").map_err(|_| ServerError::Internal)?,
+        );
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        Ok(sender)
     }
 
     pub(crate) async fn authorize_for_instance(
@@ -2734,7 +3478,7 @@ mod tests {
         AccountDirectory, AccountProfileUpdate, AuthenticatedAccount, FirstDeviceFinish,
         FirstDeviceStart, LinkComplete, LinkStart, SignupRequest, MAX_SIGNUPS_PER_MINUTE,
     };
-    use crate::DeviceAddress;
+    use crate::{DeviceAddress, OpaqueEnvelope};
     use aether_crypto::Identity;
     use uuid::Uuid;
 
@@ -2937,7 +3681,260 @@ mod tests {
         .await
         .expect("signup rate-limit table must exist");
         assert!(signup_rate_limit_table);
+        for table in [
+            "relay_messages",
+            "relay_message_hides",
+            "relay_message_read_receipts",
+            "relay_typing_states",
+        ] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT to_regclass(format('%I.%I', current_schema(), $1)) IS NOT NULL",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .expect("persistent DM history table must exist");
+            assert!(exists, "missing table {table}");
+        }
+        let persisted_payload_column: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'relay_messages' \
+               AND column_name = 'payload' AND udt_name = 'bytea')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("ciphertext payload storage must be binary");
+        assert!(persisted_payload_column);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_dm_history_preserves_ciphertext_and_enforces_message_access() {
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping PostgreSQL DM history test: TEST_DATABASE_URL is unset");
+            return;
+        };
+        let schema = format!("dm_history_test_{}", Uuid::new_v4().simple());
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("TEST_DATABASE_URL must be reachable");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin_pool)
+            .await
+            .expect("create isolated DM history schema");
+        let directory = AccountDirectory::test_directory(&database_url, "dm-history-test", &schema)
+            .await
+            .expect("DM history test directory connects");
+        let alice = DeviceAddress::new("alice", "desktop").unwrap();
+        let bob = DeviceAddress::new("bob", "phone").unwrap();
+        let mallory = DeviceAddress::new("mallory", "laptop").unwrap();
+        let alice_identity = Identity::from_secret_bytes(&[31; 32]).unwrap();
+        let bob_identity = Identity::from_secret_bytes(&[32; 32]).unwrap();
+        let mallory_identity = Identity::from_secret_bytes(&[33; 32]).unwrap();
+        directory
+            .insert_test_device(
+                &alice,
+                aether_crypto::IdentityPublicKey::from_bytes(
+                    *alice_identity.public_key().as_bytes(),
+                ),
+            )
+            .await
+            .expect("insert sender device");
+        directory
+            .insert_test_device(
+                &bob,
+                aether_crypto::IdentityPublicKey::from_bytes(*bob_identity.public_key().as_bytes()),
+            )
+            .await
+            .expect("insert recipient device");
+        directory
+            .insert_test_device(
+                &mallory,
+                aether_crypto::IdentityPublicKey::from_bytes(
+                    *mallory_identity.public_key().as_bytes(),
+                ),
+            )
+            .await
+            .expect("insert unrelated device");
+        let instance_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO relay_instances (instance_id) VALUES ($1)")
+            .bind(instance_id)
+            .execute(&directory.inner.pool)
+            .await
+            .expect("register relay instance");
+
+        let original_id = Uuid::new_v4();
+        let original_payload = vec![0, 255, 14, 0, 42];
+        let original = OpaqueEnvelope {
+            message_id: original_id,
+            sender: alice.clone(),
+            recipient: bob.clone(),
+            payload: original_payload.clone(),
+        };
+        directory
+            .persist_relay_message(instance_id, &original)
+            .await
+            .expect("persist opaque envelope");
+        let (recipient_history, has_more) = directory
+            .relay_history(instance_id, &bob, &alice, None, 50)
+            .await
+            .expect("authorized recipient can read history");
+        assert!(!has_more);
+        assert_eq!(recipient_history.len(), 1);
+        assert_eq!(recipient_history[0].envelope.payload, original_payload);
+        assert!(!recipient_history[0].deleted);
+        let (unrelated_history, _) = directory
+            .relay_history(instance_id, &mallory, &alice, None, 50)
+            .await
+            .expect("unrelated authenticated participant can query only its pair");
+        assert!(unrelated_history.is_empty());
+
+        let (receipt_sender, _) = directory
+            .record_read_receipt(instance_id, &bob, original_id)
+            .await
+            .expect("recipient can record a read receipt");
+        assert_eq!(receipt_sender, alice);
+        let (sender_history, _) = directory
+            .relay_history(instance_id, &alice, &bob, None, 50)
+            .await
+            .expect("sender can read history");
+        assert!(sender_history[0].read_at.is_some());
+
+        let second_instance = Uuid::new_v4();
+        sqlx::query("INSERT INTO relay_instances (instance_id) VALUES ($1)")
+            .bind(second_instance)
+            .execute(&directory.inner.pool)
+            .await
+            .expect("register second relay instance");
+        directory
+            .record_typing_state(instance_id, &alice, &bob, true)
+            .await
+            .expect("active sender can record expiring typing state");
+        let remote_typing = directory
+            .active_typing_states(second_instance, std::slice::from_ref(&bob))
+            .await
+            .expect("other relay instance can read typing state for its connected device");
+        assert_eq!(remote_typing.len(), 1);
+        assert_eq!(remote_typing[0].sender, alice);
+        assert_eq!(remote_typing[0].recipient, bob);
+        assert!(remote_typing[0].is_typing);
+        let unknown = DeviceAddress::new("unregistered", "desktop").unwrap();
+        assert!(directory
+            .record_typing_state(instance_id, &alice, &unknown, true)
+            .await
+            .is_err());
+        let unrelated_typing = directory
+            .active_typing_states(second_instance, std::slice::from_ref(&bob))
+            .await
+            .expect("connected recipient sees only its own typing states");
+        assert_eq!(unrelated_typing.len(), 1);
+        directory
+            .record_typing_state(instance_id, &alice, &bob, false)
+            .await
+            .expect("active sender can clear typing state");
+        let stopped_typing = directory
+            .active_typing_states(second_instance, std::slice::from_ref(&bob))
+            .await
+            .expect("typing stop is visible across relay instances");
+        assert_eq!(stopped_typing.len(), 1);
+        assert!(!stopped_typing[0].is_typing);
+        let first_claim = directory
+            .claim_pending_relay_messages(instance_id, &bob, 1)
+            .await
+            .expect("first instance claims the pending envelope");
+        assert_eq!(first_claim.len(), 1);
+        assert_eq!(first_claim[0].message_id, original_id);
+        assert_eq!(first_claim[0].payload, original_payload);
+        assert!(directory
+            .claim_pending_relay_messages(second_instance, &bob, 1)
+            .await
+            .expect("other instance observes the active lease")
+            .is_empty());
+        directory
+            .release_relay_delivery_leases(instance_id, Some(&bob))
+            .await
+            .expect("simulated instance loss releases its lease");
+        let retry = directory
+            .claim_pending_relay_messages(second_instance, &bob, 1)
+            .await
+            .expect("another instance retries after lease release");
+        assert_eq!(retry[0].message_id, original_id);
+        assert!(directory
+            .acknowledge_relay_message(instance_id, &bob, original_id)
+            .await
+            .is_err());
+        directory
+            .acknowledge_relay_message(second_instance, &bob, original_id)
+            .await
+            .expect("current lease holder accepts recipient acknowledgement");
+        directory
+            .acknowledge_relay_message(second_instance, &bob, original_id)
+            .await
+            .expect("duplicate acknowledgement is idempotent");
+        assert!(directory
+            .claim_pending_relay_messages(second_instance, &bob, 1)
+            .await
+            .expect("acknowledged message is not redelivered")
+            .is_empty());
+
+        directory
+            .hide_relay_message(instance_id, &bob, original_id)
+            .await
+            .expect("participant can hide a message for their account");
+        let (recipient_history, _) = directory
+            .relay_history(instance_id, &bob, &alice, None, 50)
+            .await
+            .expect("recipient can re-read history");
+        assert_eq!(recipient_history.len(), 1);
+        assert!(recipient_history[0].hidden);
+        let (sender_history, _) = directory
+            .relay_history(instance_id, &alice, &bob, None, 50)
+            .await
+            .expect("hide is scoped to the recipient account");
+        assert_eq!(sender_history.len(), 1);
+        assert!(!sender_history[0].hidden);
+
+        let deleted_id = Uuid::new_v4();
+        let deletable = OpaqueEnvelope {
+            message_id: deleted_id,
+            sender: alice.clone(),
+            recipient: bob.clone(),
+            payload: vec![4, 3, 2, 1],
+        };
+        directory
+            .persist_relay_message(instance_id, &deletable)
+            .await
+            .expect("persist second opaque envelope");
+        assert!(directory
+            .redact_relay_message(instance_id, &bob, deleted_id)
+            .await
+            .is_err());
+        assert_eq!(
+            directory
+                .redact_relay_message(instance_id, &alice, deleted_id)
+                .await
+                .expect("only the sender can delete for everyone"),
+            bob
+        );
+        let (recipient_history, _) = directory
+            .relay_history(instance_id, &bob, &alice, None, 50)
+            .await
+            .expect("recipient can query deleted history");
+        let deleted = recipient_history
+            .iter()
+            .find(|message| message.envelope.message_id == deleted_id)
+            .expect("deleted message remains as a tombstone");
+        assert!(deleted.deleted);
+        assert!(deleted.envelope.payload.is_empty());
+
+        directory.close_test_pool().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin_pool)
+            .await
+            .expect("drop isolated DM history schema");
+        admin_pool.close().await;
     }
 
     #[tokio::test]

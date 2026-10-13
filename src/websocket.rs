@@ -443,8 +443,15 @@ async fn handle_client_frame(
     outstanding_ping: &mut Option<(Uuid, Instant)>,
 ) -> Result<(), ()> {
     match frame {
-        ClientFrame::Send { to, payload } => {
-            match state.enqueue_from(device, connection_id, to, payload).await {
+        ClientFrame::Send {
+            to,
+            payload,
+            message_id,
+        } => {
+            match state
+                .enqueue_from_with_id(device, connection_id, to, payload, message_id)
+                .await
+            {
                 Ok(message_id) => state
                     .send_control(device, connection_id, ServerFrame::Accepted { message_id })
                     .await
@@ -454,6 +461,60 @@ async fn handle_client_frame(
         }
         ClientFrame::Ack { message_id } => {
             match state.acknowledge(device, connection_id, message_id).await {
+                Ok(()) => Ok(()),
+                Err(error) => send_error(state, device, connection_id, error).await,
+            }
+        }
+        ClientFrame::History {
+            request_id,
+            with,
+            before,
+            limit,
+        } => match state.relay_history(device, &with, before, limit).await {
+            Ok((messages, has_more)) => state
+                .send_control(
+                    device,
+                    connection_id,
+                    ServerFrame::History {
+                        request_id,
+                        with,
+                        messages,
+                        has_more,
+                    },
+                )
+                .await
+                .map_err(|_| ()),
+            Err(error) => send_error(state, device, connection_id, error).await,
+        },
+        ClientFrame::DeleteForMe { message_id } => {
+            match state.delete_message_for_me(device, message_id).await {
+                Ok(()) => state
+                    .send_control(device, connection_id, ServerFrame::Hidden { message_id })
+                    .await
+                    .map_err(|_| ()),
+                Err(error) => send_error(state, device, connection_id, error).await,
+            }
+        }
+        ClientFrame::DeleteForEveryone { message_id } => {
+            match state
+                .delete_message_for_everyone(device, connection_id, message_id)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(error) => send_error(state, device, connection_id, error).await,
+            }
+        }
+        ClientFrame::Typing { to, is_typing } => {
+            match state
+                .set_typing(device, connection_id, &to, is_typing)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(error) => send_error(state, device, connection_id, error).await,
+            }
+        }
+        ClientFrame::MarkRead { message_id } => {
+            match state.mark_message_read(device, message_id).await {
                 Ok(()) => Ok(()),
                 Err(error) => send_error(state, device, connection_id, error).await,
             }

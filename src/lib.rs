@@ -13,6 +13,7 @@ pub use error::ServerError;
 pub use http::router;
 pub use protocol::{
     AuthClientFrame, AuthServerFrame, ClientFrame, DeviceAddress, OpaqueEnvelope, ServerFrame,
+    StoredRelayMessage,
 };
 pub use state::AppState;
 
@@ -41,7 +42,13 @@ pub async fn serve(
         Some(tokio::spawn(async move {
             loop {
                 match worker_state.poll_revocations().await {
-                    Ok(()) => worker_state.set_coordination_health(true),
+                    Ok(()) => match worker_state.poll_pending_deliveries().await {
+                        Ok(()) => worker_state.set_coordination_health(true),
+                        Err(error) => {
+                            worker_state.set_coordination_health(false);
+                            tracing::error!(error = error.code(), "relay delivery polling failed");
+                        }
+                    },
                     Err(error) => {
                         worker_state.set_coordination_health(false);
                         tracing::error!(error = error.code(), "revocation coordination failed");

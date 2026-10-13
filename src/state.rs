@@ -32,6 +32,7 @@ struct Inner {
     authorizer: Arc<dyn DeviceAuthorizer>,
     accounts: Option<AccountDirectory>,
     hub: Mutex<Hub>,
+    typing_versions: Mutex<HashMap<(DeviceAddress, DeviceAddress), (String, Instant, u64)>>,
     used_auth_challenges: Mutex<HashMap<[u8; 16], Instant>>,
     authorization_locks: [Arc<Mutex<()>>; AUTHORIZATION_LOCK_STRIPES],
     next_connection_id: AtomicU64,
@@ -114,6 +115,7 @@ impl AppState {
                 authorizer,
                 accounts,
                 hub: Mutex::new(Hub::default()),
+                typing_versions: Mutex::new(HashMap::new()),
                 used_auth_challenges: Mutex::new(HashMap::new()),
                 authorization_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
                 next_connection_id: AtomicU64::new(1),
@@ -141,6 +143,88 @@ impl AppState {
             self.inner
                 .coordination_healthy
                 .store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn poll_pending_deliveries(&self) -> Result<(), ServerError> {
+        let Some(accounts) = &self.inner.accounts else {
+            return Ok(());
+        };
+        let devices: Vec<_> = self
+            .inner
+            .hub
+            .lock()
+            .await
+            .connections
+            .keys()
+            .cloned()
+            .collect();
+        for device in &devices {
+            let envelopes = accounts
+                .claim_pending_relay_messages(self.inner.instance_id, device, 1)
+                .await?;
+            for envelope in envelopes {
+                let mut hub = self.inner.hub.lock().await;
+                let Some(connection) = hub.connections.get_mut(device) else {
+                    continue;
+                };
+                if connection.sent_message_ids.contains(&envelope.message_id) {
+                    continue;
+                }
+                match connection
+                    .sender
+                    .try_send(OutboundFrame::Protocol(ServerFrame::Deliver {
+                        envelope: envelope.clone(),
+                    })) {
+                    Ok(()) => {
+                        connection.sent_message_ids.insert(envelope.message_id);
+                    }
+                    Err(
+                        mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_),
+                    ) => {}
+                }
+            }
+        }
+        for state in accounts
+            .active_typing_states(self.inner.instance_id, &devices)
+            .await?
+        {
+            let Some(connection_id) = self.current_connection_id(&state.recipient).await else {
+                continue;
+            };
+            let key = (state.sender.clone(), state.recipient.clone());
+            let is_new = {
+                let mut versions = self.inner.typing_versions.lock().await;
+                if versions.get(&key).is_some_and(|(version, _, connection)| {
+                    version == &state.updated_at && *connection == connection_id
+                }) {
+                    false
+                } else {
+                    if versions.len() >= 10_000 {
+                        versions.retain(|_, (_, seen_at, _)| {
+                            seen_at.elapsed() < Duration::from_secs(30)
+                        });
+                        if versions.len() >= 10_000 {
+                            versions.clear();
+                        }
+                    }
+                    versions.insert(key, (state.updated_at, Instant::now(), connection_id));
+                    true
+                }
+            };
+            if is_new {
+                let _ = self
+                    .send_control(
+                        &state.recipient,
+                        connection_id,
+                        ServerFrame::Typing {
+                            from: state.sender,
+                            is_typing: state.is_typing,
+                        },
+                    )
+                    .await;
+            }
         }
         Ok(())
     }
@@ -496,6 +580,17 @@ impl AppState {
         {
             hub.connections.remove(address);
         }
+        if let Some(accounts) = &self.inner.accounts {
+            if let Err(error) = accounts
+                .release_relay_delivery_leases(self.inner.instance_id, Some(address))
+                .await
+            {
+                tracing::error!(
+                    error = error.code(),
+                    "could not release relay delivery lease"
+                );
+            }
+        }
     }
 
     pub(crate) async fn refill(&self, address: &DeviceAddress, id: u64) {
@@ -509,6 +604,7 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn enqueue_from(
         &self,
         sender: &DeviceAddress,
@@ -516,8 +612,27 @@ impl AppState {
         recipient: DeviceAddress,
         payload: Vec<u8>,
     ) -> Result<Uuid, ServerError> {
-        self.enqueue_from_after_authorization(sender, connection_id, recipient, payload, async {})
+        self.enqueue_from_with_id(sender, connection_id, recipient, payload, None)
             .await
+    }
+
+    pub(crate) async fn enqueue_from_with_id(
+        &self,
+        sender: &DeviceAddress,
+        connection_id: u64,
+        recipient: DeviceAddress,
+        payload: Vec<u8>,
+        message_id: Option<Uuid>,
+    ) -> Result<Uuid, ServerError> {
+        self.enqueue_from_after_authorization(
+            sender,
+            connection_id,
+            recipient,
+            payload,
+            message_id,
+            async {},
+        )
+        .await
     }
 
     async fn enqueue_from_after_authorization<F>(
@@ -526,6 +641,7 @@ impl AppState {
         connection_id: u64,
         recipient: DeviceAddress,
         payload: Vec<u8>,
+        message_id: Option<Uuid>,
         after_authorization: F,
     ) -> Result<Uuid, ServerError>
     where
@@ -537,8 +653,32 @@ impl AppState {
         let _guards = self.lock_devices_authorization(sender, &recipient).await;
         self.authorize_relay_pair(sender, &recipient).await?;
         after_authorization.await;
-        self.enqueue_inner(sender.clone(), recipient, payload, Some(connection_id))
-            .await
+        sender.validate()?;
+        recipient.validate()?;
+        if payload.len() > self.inner.config.max_message_bytes {
+            return Err(ServerError::MessageTooLarge);
+        }
+        let envelope = OpaqueEnvelope {
+            message_id: message_id.unwrap_or_else(Uuid::new_v4),
+            sender: sender.clone(),
+            recipient,
+            payload,
+        };
+        let persisted = if let Some(accounts) = &self.inner.accounts {
+            accounts
+                .persist_relay_message(self.inner.instance_id, &envelope)
+                .await?;
+            true
+        } else {
+            false
+        };
+        let message_id = envelope.message_id;
+        if persisted {
+            return Ok(message_id);
+        }
+        self.enqueue_envelope_inner(envelope, Some(connection_id))
+            .await?;
+        Ok(message_id)
     }
 
     #[cfg(test)]
@@ -556,6 +696,7 @@ impl AppState {
             connection_id,
             recipient,
             payload,
+            None,
             async move {
                 let _ = started.send(());
                 let _ = resume.await;
@@ -590,6 +731,168 @@ impl AppState {
         self.authorize_relay_pair(sender, recipient).await
     }
 
+    pub(crate) async fn relay_history(
+        &self,
+        device: &DeviceAddress,
+        with: &DeviceAddress,
+        before: Option<Uuid>,
+        limit: u16,
+    ) -> Result<(Vec<crate::protocol::StoredRelayMessage>, bool), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        let estimated_max_envelope_bytes = self
+            .inner
+            .config
+            .max_message_bytes
+            .saturating_mul(4)
+            .saturating_add(1024);
+        let frame_safe_limit = (self.inner.config.max_websocket_frame_bytes
+            / estimated_max_envelope_bytes)
+            .max(1)
+            .min(usize::from(limit)) as u16;
+        let _guards = self.lock_devices_authorization(device, with).await;
+        self.inner
+            .accounts
+            .as_ref()
+            .ok_or(ServerError::Unavailable)?
+            .relay_history(
+                self.inner.instance_id,
+                device,
+                with,
+                before,
+                frame_safe_limit,
+            )
+            .await
+    }
+
+    pub(crate) async fn delete_message_for_me(
+        &self,
+        device: &DeviceAddress,
+        message_id: Uuid,
+    ) -> Result<(), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        let _guard = self.lock_device_authorization(device).await;
+        self.authorize_recipient(device).await?;
+        self.inner
+            .accounts
+            .as_ref()
+            .ok_or(ServerError::Unavailable)?
+            .hide_relay_message(self.inner.instance_id, device, message_id)
+            .await
+    }
+
+    pub(crate) async fn delete_message_for_everyone(
+        &self,
+        device: &DeviceAddress,
+        connection_id: u64,
+        message_id: Uuid,
+    ) -> Result<(), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        let _guard = self.lock_device_authorization(device).await;
+        self.authorize_recipient(device).await?;
+        let recipient = self
+            .inner
+            .accounts
+            .as_ref()
+            .ok_or(ServerError::Unavailable)?
+            .redact_relay_message(self.inner.instance_id, device, message_id)
+            .await?;
+        self.send_control(device, connection_id, ServerFrame::Deleted { message_id })
+            .await?;
+        if let Some(recipient_connection) = self.current_connection_id(&recipient).await {
+            let _ = self
+                .send_control(
+                    &recipient,
+                    recipient_connection,
+                    ServerFrame::Deleted { message_id },
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn set_typing(
+        &self,
+        device: &DeviceAddress,
+        connection_id: u64,
+        recipient: &DeviceAddress,
+        is_typing: bool,
+    ) -> Result<(), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        let _guards = self.lock_devices_authorization(device, recipient).await;
+        self.authorize_relay_pair(device, recipient).await?;
+        if !self.is_current_connection(device, connection_id).await {
+            return Err(ServerError::ShuttingDown);
+        }
+        if let Some(accounts) = &self.inner.accounts {
+            accounts
+                .record_typing_state(self.inner.instance_id, device, recipient, is_typing)
+                .await?;
+            return Ok(());
+        }
+        if let Some(recipient_connection) = self.current_connection_id(recipient).await {
+            self.send_control(
+                recipient,
+                recipient_connection,
+                ServerFrame::Typing {
+                    from: device.clone(),
+                    is_typing,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn mark_message_read(
+        &self,
+        device: &DeviceAddress,
+        message_id: Uuid,
+    ) -> Result<(), ServerError> {
+        if !self.is_ready() {
+            return Err(ServerError::Unavailable);
+        }
+        let _guard = self.lock_device_authorization(device).await;
+        self.authorize_recipient(device).await?;
+        let (sender, read_at) = self
+            .inner
+            .accounts
+            .as_ref()
+            .ok_or(ServerError::Unavailable)?
+            .record_read_receipt(self.inner.instance_id, device, message_id)
+            .await?;
+        if let Some(connection_id) = self.current_connection_id(&sender).await {
+            let _ = self
+                .send_control(
+                    &sender,
+                    connection_id,
+                    ServerFrame::ReadReceipt {
+                        message_id,
+                        read_at,
+                    },
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn current_connection_id(&self, address: &DeviceAddress) -> Option<u64> {
+        self.inner
+            .hub
+            .lock()
+            .await
+            .connections
+            .get(address)
+            .map(|connection| connection.id)
+    }
+
     pub(crate) async fn is_current_connection(&self, address: &DeviceAddress, id: u64) -> bool {
         self.inner
             .hub
@@ -607,15 +910,18 @@ impl AppState {
         recipient: DeviceAddress,
         payload: Vec<u8>,
     ) -> Result<Uuid, ServerError> {
-        self.enqueue_inner(sender, recipient, payload, None).await
+        self.enqueue_inner(sender, recipient, payload, None, None)
+            .await
     }
 
+    #[cfg(test)]
     async fn enqueue_inner(
         &self,
         sender: DeviceAddress,
         recipient: DeviceAddress,
         payload: Vec<u8>,
         expected_connection_id: Option<u64>,
+        message_id: Option<Uuid>,
     ) -> Result<Uuid, ServerError> {
         if !self.is_ready() {
             return Err(ServerError::ShuttingDown);
@@ -625,14 +931,26 @@ impl AppState {
         if payload.len() > self.inner.config.max_message_bytes {
             return Err(ServerError::MessageTooLarge);
         }
-        let payload_len = payload.len();
-        let message_id = Uuid::new_v4();
         let envelope = OpaqueEnvelope {
-            message_id,
+            message_id: message_id.unwrap_or_else(Uuid::new_v4),
             sender: sender.clone(),
             recipient: recipient.clone(),
             payload,
         };
+        let message_id = envelope.message_id;
+        self.enqueue_envelope_inner(envelope, expected_connection_id)
+            .await?;
+        Ok(message_id)
+    }
+
+    async fn enqueue_envelope_inner(
+        &self,
+        envelope: OpaqueEnvelope,
+        expected_connection_id: Option<u64>,
+    ) -> Result<(), ServerError> {
+        let recipient = envelope.recipient.clone();
+        let sender = envelope.sender.clone();
+        let payload_len = envelope.payload.len();
         let encoded = serde_json::to_vec(&envelope).map_err(|_| ServerError::Internal)?;
         if encoded.len() > self.inner.config.max_websocket_frame_bytes {
             return Err(ServerError::MessageTooLarge);
@@ -690,7 +1008,7 @@ impl AppState {
         hub.queued_messages += 1;
         hub.queued_bytes += payload_len;
         pump_device(&mut hub, &recipient);
-        Ok(message_id)
+        Ok(())
     }
 
     pub(crate) async fn acknowledge(
@@ -704,6 +1022,27 @@ impl AppState {
         }
         let _guard = self.lock_device_authorization(recipient).await;
         self.authorize_recipient(recipient).await?;
+        if let Some(accounts) = &self.inner.accounts {
+            {
+                let hub = self.inner.hub.lock().await;
+                hub.connections
+                    .get(recipient)
+                    .filter(|connection| connection.id == connection_id)
+                    .ok_or(ServerError::InvalidAcknowledgement)?;
+            }
+            accounts
+                .acknowledge_relay_message(self.inner.instance_id, recipient, message_id)
+                .await?;
+            let mut hub = self.inner.hub.lock().await;
+            if let Some(connection) = hub
+                .connections
+                .get_mut(recipient)
+                .filter(|connection| connection.id == connection_id)
+            {
+                connection.sent_message_ids.remove(&message_id);
+            }
+            return Ok(());
+        }
         let mut hub = self.inner.hub.lock().await;
         let connection = hub
             .connections

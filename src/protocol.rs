@@ -51,12 +51,53 @@ pub struct OpaqueEnvelope {
     pub payload: Vec<u8>,
 }
 
+/// A persisted envelope returned by authenticated conversation-history queries.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredRelayMessage {
+    pub envelope: OpaqueEnvelope,
+    pub created_at: String,
+    pub deleted: bool,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientFrame {
-    Send { to: DeviceAddress, payload: Vec<u8> },
-    Ack { message_id: Uuid },
-    Pong { nonce: Uuid },
+    Send {
+        to: DeviceAddress,
+        payload: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<Uuid>,
+    },
+    Ack {
+        message_id: Uuid,
+    },
+    History {
+        request_id: Uuid,
+        with: DeviceAddress,
+        before: Option<Uuid>,
+        limit: u16,
+    },
+    DeleteForMe {
+        message_id: Uuid,
+    },
+    DeleteForEveryone {
+        message_id: Uuid,
+    },
+    Typing {
+        to: DeviceAddress,
+        is_typing: bool,
+    },
+    MarkRead {
+        message_id: Uuid,
+    },
+    Pong {
+        nonce: Uuid,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -83,10 +124,38 @@ pub enum AuthServerFrame {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
-    Accepted { message_id: Uuid },
-    Deliver { envelope: OpaqueEnvelope },
-    Ping { nonce: Uuid },
-    Error { code: String },
+    Accepted {
+        message_id: Uuid,
+    },
+    Deliver {
+        envelope: OpaqueEnvelope,
+    },
+    History {
+        request_id: Uuid,
+        with: DeviceAddress,
+        messages: Vec<StoredRelayMessage>,
+        has_more: bool,
+    },
+    Deleted {
+        message_id: Uuid,
+    },
+    Hidden {
+        message_id: Uuid,
+    },
+    Typing {
+        from: DeviceAddress,
+        is_typing: bool,
+    },
+    ReadReceipt {
+        message_id: Uuid,
+        read_at: String,
+    },
+    Ping {
+        nonce: Uuid,
+    },
+    Error {
+        code: String,
+    },
 }
 
 pub(crate) fn parse_client_frame(
@@ -100,13 +169,24 @@ pub(crate) fn parse_client_frame(
     let frame: ClientFrame =
         serde_json::from_slice(encoded).map_err(|_| ServerError::InvalidRequest)?;
     match &frame {
-        ClientFrame::Send { to, payload } => {
+        ClientFrame::Send { to, payload, .. } => {
             to.validate()?;
             if payload.len() > max_message_bytes {
                 return Err(ServerError::MessageTooLarge);
             }
         }
-        ClientFrame::Ack { .. } | ClientFrame::Pong { .. } => {}
+        ClientFrame::History { with, limit, .. } => {
+            with.validate()?;
+            if *limit == 0 || *limit > 100 {
+                return Err(ServerError::InvalidRequest);
+            }
+        }
+        ClientFrame::Typing { to, .. } => to.validate()?,
+        ClientFrame::Ack { .. }
+        | ClientFrame::DeleteForMe { .. }
+        | ClientFrame::DeleteForEveryone { .. }
+        | ClientFrame::MarkRead { .. }
+        | ClientFrame::Pong { .. } => {}
     }
     Ok(frame)
 }
