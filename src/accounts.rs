@@ -74,7 +74,7 @@ struct RegistrationCeremony {
 struct AuthenticationCeremony {
     account_id: Uuid,
     state: PasskeyAuthentication,
-    callback_uri: String,
+    callback_uri: Option<String>,
     browser_state: String,
     code_challenge: Vec<u8>,
     expires_at: Instant,
@@ -136,7 +136,8 @@ pub(crate) struct RegistrationFinish {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SigninStart {
     pub tag: String,
-    pub callback_uri: String,
+    #[serde(default)]
+    pub callback_uri: Option<String>,
     pub state: String,
     pub code_challenge: String,
 }
@@ -174,6 +175,13 @@ pub(crate) struct SessionExchange {
     pub state: String,
     pub code_verifier: String,
     pub callback_uri: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionPoll {
+    pub state: String,
+    pub code_verifier: String,
 }
 
 #[derive(Deserialize)]
@@ -654,7 +662,10 @@ impl AccountDirectory {
         request: SigninStart,
     ) -> Result<SigninStartResponse, ServerError> {
         let tag = validate_tag(&request.tag)?;
-        let callback_uri = validate_loopback_callback(&request.callback_uri)?;
+        let callback_uri = request
+            .callback_uri
+            .map(|uri| validate_loopback_callback(&uri))
+            .transpose()?;
         validate_browser_state(&request.state)?;
         let code_challenge = validate_code_challenge(&request.code_challenge)?;
         let row = sqlx::query(
@@ -745,6 +756,11 @@ impl AccountDirectory {
         }
         let exchange_code = opaque_token();
         let code_hash = hash_token(&exchange_code);
+        let hosted_callback_uri = format!("{}/account/complete", self.inner.webauthn_origin);
+        let stored_callback_uri = ceremony
+            .callback_uri
+            .as_deref()
+            .unwrap_or(&hosted_callback_uri);
         sqlx::query(
             "INSERT INTO browser_session_exchanges \
              (code_hash, account_id, callback_uri, state_hash, code_challenge_hash, expires_at) \
@@ -753,18 +769,18 @@ impl AccountDirectory {
         )
         .bind(code_hash)
         .bind(ceremony.account_id)
-        .bind(&ceremony.callback_uri)
+        .bind(stored_callback_uri)
         .bind(hash_token(&ceremony.browser_state))
         .bind(&ceremony.code_challenge)
         .bind(PASSKEY_CEREMONY_TTL.as_secs() as i64)
         .execute(&self.inner.pool)
         .await
         .map_err(|_| ServerError::Internal)?;
-        let redirect_uri = make_callback_uri(
-            &ceremony.callback_uri,
-            &exchange_code,
-            &ceremony.browser_state,
-        )?;
+        let redirect_uri = if let Some(callback_uri) = ceremony.callback_uri {
+            make_callback_uri(&callback_uri, &exchange_code, &ceremony.browser_state)?
+        } else {
+            hosted_callback_uri
+        };
         Ok(SigninHandoffResponse { redirect_uri })
     }
 
@@ -839,6 +855,83 @@ impl AccountDirectory {
             session_token: token,
             expires_at,
         })
+    }
+
+    pub(crate) async fn poll_session(
+        &self,
+        request: SessionPoll,
+    ) -> Result<Option<SigninResponse>, ServerError> {
+        validate_browser_state(&request.state).map_err(|_| ServerError::Unauthorized)?;
+        let code_challenge_hash = code_challenge_for_verifier(&request.code_verifier)
+            .map_err(|_| ServerError::Unauthorized)?;
+        let state_hash = hash_token(&request.state);
+        let hosted_callback_uri = format!("{}/account/complete", self.inner.webauthn_origin);
+        let mut transaction = self
+            .inner
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        let row = sqlx::query(
+            "WITH exchange AS ( \
+               SELECT code_hash FROM browser_session_exchanges \
+               WHERE state_hash = $1 AND code_challenge_hash = $2 \
+                 AND callback_uri = $3 AND consumed_at IS NULL AND expires_at > now() \
+               ORDER BY created_at DESC LIMIT 1 FOR UPDATE \
+             ) \
+             UPDATE browser_session_exchanges e SET consumed_at = now() \
+             FROM exchange WHERE e.code_hash = exchange.code_hash \
+             RETURNING e.account_id",
+        )
+        .bind(state_hash)
+        .bind(code_challenge_hash)
+        .bind(hosted_callback_uri)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        let Some(row) = row else {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| ServerError::Internal)?;
+            return Ok(None);
+        };
+        let account_id: Uuid = row
+            .try_get("account_id")
+            .map_err(|_| ServerError::Internal)?;
+        let account = sqlx::query("SELECT tag FROM accounts WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| ServerError::Internal)?
+            .ok_or(ServerError::Unauthorized)?;
+        let tag: String = account.try_get("tag").map_err(|_| ServerError::Internal)?;
+        let token = opaque_token();
+        let token_hash = hash_token(&token);
+        let session_row = sqlx::query(
+            "INSERT INTO account_sessions (token_hash, account_id, expires_at) \
+             VALUES ($1, $2, now() + ($3::double precision * interval '1 second')) \
+             RETURNING floor(extract(epoch from expires_at))::bigint AS expires_at",
+        )
+        .bind(&token_hash)
+        .bind(account_id)
+        .bind(SESSION_TTL.as_secs() as i64)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| ServerError::Internal)?;
+        let expires_at = session_row
+            .try_get("expires_at")
+            .map_err(|_| ServerError::Internal)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ServerError::Internal)?;
+        Ok(Some(SigninResponse {
+            account_id,
+            tag,
+            session_token: token,
+            expires_at,
+        }))
     }
 
     pub(crate) async fn verify_email(
@@ -3474,9 +3567,10 @@ mod tests {
     use base64::Engine as _;
 
     use super::{
-        hash_token, normalize_tag, validate_email, validate_profile_update, validate_tag,
-        AccountDirectory, AccountProfileUpdate, AuthenticatedAccount, FirstDeviceFinish,
-        FirstDeviceStart, LinkComplete, LinkStart, SignupRequest, MAX_SIGNUPS_PER_MINUTE,
+        code_challenge_for_verifier, hash_token, normalize_tag, validate_email,
+        validate_profile_update, validate_tag, AccountDirectory, AccountProfileUpdate,
+        AuthenticatedAccount, FirstDeviceFinish, FirstDeviceStart, LinkComplete, LinkStart,
+        SessionPoll, SignupRequest, MAX_SIGNUPS_PER_MINUTE, URL_SAFE_NO_PAD,
     };
     use crate::{DeviceAddress, OpaqueEnvelope};
     use aether_crypto::Identity;
@@ -3592,7 +3686,7 @@ mod tests {
     fn browser_handoff_requires_literal_loopback_port_and_256_bit_state() {
         use super::{
             code_challenge_for_verifier, validate_browser_state, validate_code_challenge,
-            validate_loopback_callback, URL_SAFE_NO_PAD,
+            validate_loopback_callback, SigninStart, URL_SAFE_NO_PAD,
         };
         use sha2::{Digest, Sha256};
 
@@ -3607,6 +3701,24 @@ mod tests {
         assert!(validate_loopback_callback("http://user@127.0.0.1:49152/callback").is_err());
         let state = URL_SAFE_NO_PAD.encode([19u8; 32]);
         assert!(validate_browser_state(&state).is_ok());
+        let hosted_start: SigninStart = serde_json::from_value(serde_json::json!({
+            "tag": "alice",
+            "state": state.clone(),
+            "code_challenge": state.clone()
+        }))
+        .unwrap();
+        assert!(hosted_start.callback_uri.is_none());
+        let loopback_start: SigninStart = serde_json::from_value(serde_json::json!({
+            "tag": "alice",
+            "callback_uri": "http://127.0.0.1:49152/void/callback",
+            "state": state.clone(),
+            "code_challenge": state.clone()
+        }))
+        .unwrap();
+        assert_eq!(
+            loopback_start.callback_uri.as_deref(),
+            Some("http://127.0.0.1:49152/void/callback")
+        );
         assert_eq!(validate_code_challenge(&state).unwrap(), [19u8; 32]);
         let verifier = URL_SAFE_NO_PAD.encode([27u8; 32]);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest([27u8; 32]));
@@ -3705,6 +3817,15 @@ mod tests {
         .await
         .expect("ciphertext payload storage must be binary");
         assert!(persisted_payload_column);
+        let hosted_poll_index: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes \
+             WHERE schemaname = current_schema() AND tablename = 'browser_session_exchanges' \
+               AND indexname = 'browser_session_exchanges_hosted_poll_idx')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("hosted sign-in poll index must exist");
+        assert!(hosted_poll_index);
         pool.close().await;
     }
 
@@ -3742,6 +3863,55 @@ mod tests {
             )
             .await
             .expect("insert sender device");
+        let alice_account_id: Uuid = sqlx::query_scalar(
+            "SELECT account_id FROM account_devices WHERE user_id = $1 AND device_id = $2",
+        )
+        .bind(&alice.user_id)
+        .bind(&alice.device_id)
+        .fetch_one(&directory.inner.pool)
+        .await
+        .expect("sender account exists");
+        let browser_state = URL_SAFE_NO_PAD.encode([61u8; 32]);
+        let verifier = URL_SAFE_NO_PAD.encode([62u8; 32]);
+        let challenge_hash = code_challenge_for_verifier(&verifier).unwrap();
+        sqlx::query(
+            "INSERT INTO browser_session_exchanges \
+             (code_hash, account_id, callback_uri, state_hash, code_challenge_hash, expires_at) \
+             VALUES ($1, $2, 'https://localhost/account/complete', $3, $4, now() + interval '5 minutes')",
+        )
+        .bind(hash_token("hosted-signin-code"))
+        .bind(alice_account_id)
+        .bind(hash_token(&browser_state))
+        .bind(challenge_hash)
+        .execute(&directory.inner.pool)
+        .await
+        .expect("insert hosted passkey completion");
+        let pending = directory
+            .poll_session(SessionPoll {
+                state: browser_state.clone(),
+                code_verifier: URL_SAFE_NO_PAD.encode([63u8; 32]),
+            })
+            .await
+            .expect("wrong verifier is not a completed login");
+        assert!(pending.is_none());
+        let completed = directory
+            .poll_session(SessionPoll {
+                state: browser_state.clone(),
+                code_verifier: verifier,
+            })
+            .await
+            .expect("native client can exchange matching PKCE verifier");
+        let completed = completed.expect("passkey completion yields one session");
+        assert_eq!(completed.account_id, alice_account_id);
+        assert!(!completed.session_token.is_empty());
+        assert!(directory
+            .poll_session(SessionPoll {
+                state: browser_state,
+                code_verifier: URL_SAFE_NO_PAD.encode([62u8; 32]),
+            })
+            .await
+            .expect("replayed hosted handoff remains consumed")
+            .is_none());
         directory
             .insert_test_device(
                 &bob,

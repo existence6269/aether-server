@@ -88,7 +88,7 @@ is not production-ready.
 ### Multi-instance revocation operations
 
 The database schema must be migrated through
-`0009_reliable_dm_synchronization.sql` before deploying this version. All
+`0010_hosted_signin_handoff.sql` before deploying this version. All
 instances must use the same PostgreSQL database
 and a consistent schema. For the first rollout, drain and confirm shutdown of
 every pre-coordination server before enabling revocation on this version;
@@ -241,47 +241,39 @@ and must not be the desktop React/Tauri origin.
    An account cannot sign in or appear in the public directory until its
    passkey registration has completed. Email is contact information, not an
    authentication factor; the account is owned by the passkey.
-3. For Tauri system-browser sign-in, first have the native client listen on an
-   available loopback port at an exact path, e.g.
-   `http://127.0.0.1:49152/void/callback`. Generate separate 32-byte
+3. For Tauri system-browser sign-in, generate separate 32-byte
    cryptographically random values for `state` and `code_verifier`; encode
    both as unpadded base64url (43 characters). Compute
-   `code_challenge = BASE64URL_NOPAD(SHA256( decoded code_verifier bytes ))`.
-   Keep the verifier only in native memory. Open
-   `/account?callback_uri=<percent-encoded-loopback-URL>&state=<state>&code_challenge=<code_challenge>`
-   in the system browser. The portal links to sign-in while preserving those
-   parameters. The hosted page asks for the account tag, performs the passkey
-   assertion, and redirects only to the supplied loopback URI with `code` and
-   the unchanged `state` query parameters; it never receives the verifier.
-   The bearer token is never returned to the browser page or included in its
-   redirect.
+   `code_challenge = BASE64URL_NOPAD(SHA256(decoded code_verifier bytes))`.
+   Keep the verifier only in native memory. Open the hosted
+   `/account/signin?tag=<tag>#state=<state>&code_challenge=<code_challenge>`
+   page on the configured WebAuthn origin. The state and challenge are in the
+   URL fragment, which is not sent to the server, and the page removes the
+   fragment from its address bar as soon as it reads them. The page performs the passkey
+   assertion and returns the browser to the same host at `/account/complete`.
+   No code, verifier, or bearer session token is placed in that URL.
 
-   The equivalent JSON ceremony contract is
-   `POST /api/accounts/signin` with
-   `{"tag":"alice","callback_uri":"http://127.0.0.1:49152/void/callback","state":"<43-char-base64url-state>","code_challenge":"<43-char-base64url-SHA256-verifier>"}`.
+   The equivalent JSON ceremony contract is `POST /api/accounts/signin` with
+   `{"tag":"alice","state":"<43-char-base64url-state>","code_challenge":"<43-char-base64url-SHA256-verifier>"}`.
    The response is `{"ceremony_id":"<uuid>","options":{"publicKey":{...}}}`.
    Pass `options.publicKey` to `navigator.credentials.get()`, then POST
    `{"ceremony_id":"<uuid>","credential":{...browser assertion JSON...}}` to
-   `/api/accounts/signin/finish`. That returns only
-   `{"redirect_uri":"http://127.0.0.1:49152/void/callback?code=<opaque>&state=<state>"}`.
-   The hosted page navigates to `redirect_uri`.
+   `/api/accounts/signin/finish`. It returns the fixed hosted completion URL,
+   `{"redirect_uri":"https://<configured-origin>/account/complete"}`.
+   The native app polls `/api/accounts/session/poll` with
+   `{"state":"<state>","code_verifier":"<original verifier>"}`. A `204 No
+   Content` response means the browser ceremony is still pending; a successful
+   JSON response contains the session token and is consumed exactly once.
+   The server verifies the state and PKCE challenge atomically; pending
+   exchanges expire after five minutes. The browser never receives the
+   verifier or bearer token. This polling request requires HTTPS and the
+   client must use the standard bearer authorization header for subsequent
+   authenticated account API calls.
 
-   The native listener must check the returned state exactly against the
-   original random state, extract code/state, then POST
-   `{"code":"<opaque code>","state":"<state>","code_verifier":"<original 43-char verifier>","callback_uri":"<same callback URI>"}`
-   to `/api/accounts/session/exchange` using a native HTTP client. The server
-   verifies the PKCE-style SHA-256 verifier challenge and atomically consumes
-   the code/state/callback tuple. Only that one-time exchange returns
-   `{"account_id":"<uuid>","tag":"alice","session_token":"<bearer>","expires_at":<unix seconds>}`.
-   Codes expire after five minutes and are consumed atomically; a replay,
-   verifier, callback, or state mismatch fails. The callback must use plain HTTP with an
-   explicit nonzero port and a literal loopback IP (`127.0.0.0/8` or `::1`),
-   with no userinfo, query, or fragment in the registered callback URL.
-   Hostnames (including `localhost`), non-loopback IPs, HTTPS URLs, and
-   implicit/default ports are rejected. Native clients must use their
-   32-byte random state to prevent login CSRF and bind the response to the
-   initiating app request. Authenticated HTTP calls use the standard bearer
-   authorization header with the exchanged session token.
+   The server continues to accept the previous optional loopback callback
+   format for older clients. Deploy the updated account server and apply its
+   migrations before distributing a client that uses hosted completion and
+   polling; an older server does not expose `/api/accounts/session/poll`.
 
    For other system-browser clients, implement the same form, WebAuthn API
    credential conversions, and callback behavior using the documented JSON
@@ -384,13 +376,14 @@ transaction. Only active records are returned or accepted for relay auth.
 Email verification tokens, session bearer tokens, browser exchange codes, and
 browser state and PKCE challenge values are stored only as SHA-256 hashes in
 the database; the PKCE verifier is never sent to or stored by the server. The
-callback listener must bind only to loopback and should stop listening after
-receiving its single callback. No account session cookies are issued. Passkey
-proofs and private keys are never logged or returned. Resend failures do not
-return provider details. API
-transport must be protected by TLS; ensure ingress access logs redact the
-email-verification query token and sign-in query state. Passkey ceremonies are
-process-local, so
+legacy callback listener must bind only to loopback and stop listening after
+its single callback; the current native client uses hosted completion and
+polling instead. No account session cookies are issued. Passkey proofs and
+private keys are never logged or returned. Resend failures do not return
+provider details. API transport must be protected by TLS; ensure ingress access
+logs redact the email-verification query token and legacy sign-in query state.
+Current sign-in state and challenge are sent in the browser URL fragment, not
+in the HTTP request. Passkey ceremonies are process-local, so
 an in-flight browser ceremony cannot be completed after a process restart or
 on a different server instance.
 

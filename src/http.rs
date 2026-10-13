@@ -34,6 +34,14 @@ const EMAIL_VERIFICATION_ERROR_HTML: &str = r#"<!doctype html>
 <p><a href="/account">Return to the Void account portal</a></p>
 </main></body></html>"#;
 
+const ACCOUNT_SIGNIN_COMPLETE_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Sign-in complete — Void</title><style>
+body{font:16px system-ui,sans-serif;max-width:36rem;margin:10vh auto;padding:1rem;color:#222}
+</style></head><body><main><h1>Passkey verified</h1>
+<p>Sign-in is complete. Return to the Void desktop app; you can close this tab.</p>
+</main></body></html>"#;
+
 pub fn router(state: AppState) -> Router {
     let cors = state
         .accounts()
@@ -51,12 +59,14 @@ pub fn router(state: AppState) -> Router {
         .route("/ws", get(websocket::upgrade))
         .route("/account", get(account_portal))
         .route("/account/signin", get(system_browser_signin))
+        .route("/account/complete", get(account_signin_complete))
         .route("/account/signup", get(system_browser_signup))
         .route("/api/accounts/signup", post(signup))
         .route("/api/accounts/signup/finish", post(finish_signup))
         .route("/api/accounts/signin", post(start_signin))
         .route("/api/accounts/signin/finish", post(finish_signin))
         .route("/api/accounts/session/exchange", post(exchange_session))
+        .route("/api/accounts/session/poll", post(poll_session))
         .route(
             "/api/accounts/email/verify",
             get(verify_email_link).post(verify_email),
@@ -152,6 +162,28 @@ async fn exchange_session(
     Ok(Json(directory(&state)?.exchange_session(request).await?))
 }
 
+async fn poll_session(
+    State(state): State<AppState>,
+    Json(request): Json<crate::accounts::SessionPoll>,
+) -> Result<Response, ServerError> {
+    let mut response = match directory(&state)?.poll_session(request).await? {
+        Some(session) => Json(session).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+async fn account_signin_complete(State(state): State<AppState>) -> Result<Response, ServerError> {
+    directory(&state)?;
+    let mut response = Html(ACCOUNT_SIGNIN_COMPLETE_HTML).into_response();
+    set_account_page_headers(&mut response);
+    Ok(response)
+}
+
 async fn account_portal(State(state): State<AppState>) -> Result<Response, ServerError> {
     directory(&state)?;
     let mut response = Html(ACCOUNT_PORTAL_HTML).into_response();
@@ -200,7 +232,7 @@ const ACCOUNT_PORTAL_HTML: &str = r#"<!doctype html>
 body{font:16px system-ui,sans-serif;max-width:36rem;margin:10vh auto;padding:1rem;color:#222}
 a{color:#164b80}li{margin:1rem 0}
 </style></head><body><main><h1>Void account</h1>
-<p>Use a passkey in this system browser to create your account. To sign in to the Void desktop app, start sign-in in the app; it opens this page with a one-time secure return to the app.</p>
+<p>Use a passkey in this system browser to create your account. To sign in to the Void desktop app, start sign-in in the app; it opens the hosted passkey page and securely completes sign-in in the app.</p>
 <nav aria-label="Account actions"><ul>
 <li><a id="signin" href="/account/signin">Sign in with a passkey</a></li>
 <li><a href="/account/signup">Create an account with a passkey</a></li>
@@ -224,15 +256,16 @@ input,button{font:inherit;padding:.75rem}button{cursor:pointer}
 <button type="submit">Continue with passkey</button></form><p id="status" role="status" aria-live="polite"></p>
 <script>
 const form=document.getElementById("signin"),status=document.getElementById("status");
-const params=new URLSearchParams(location.search),callbackUri=params.get("callback_uri"),state=params.get("state"),codeChallenge=params.get("code_challenge");
+const params=new URLSearchParams(location.search),handoff=new URLSearchParams(location.hash.slice(1)),state=handoff.get("state"),codeChallenge=handoff.get("code_challenge");
+history.replaceState(null,"",location.pathname+location.search);
 document.getElementById("tag").value=params.get("tag")||"";
 async function apiError(response,fallback){let code="";try{code=(await response.json()).error||""}catch(_){}const messages={invalid_request:"Check the account details and try again.",unauthorized:"The tag or passkey could not be verified. Check the tag and try again.",resource_limit:"Too many sign-in attempts are pending. Wait a moment and try again.",unavailable:"Account services are temporarily unavailable.",internal:"The server could not complete sign-in. Try again later."};return messages[code]||fallback}
 function b64url(bytes){let s="";for(const b of new Uint8Array(bytes))s+=String.fromCharCode(b);return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
 function fromB64url(s){const p=s.replace(/-/g,"+").replace(/_/g,"/");return Uint8Array.from(atob(p+"=".repeat((4-p.length%4)%4)),c=>c.charCodeAt(0))}
 function credentialJson(c){if(typeof c.toJSON==="function")return c.toJSON();const r=c.response,out={id:c.id,rawId:b64url(c.rawId),type:c.type,authenticatorAttachment:c.authenticatorAttachment,response:{clientDataJSON:b64url(r.clientDataJSON)}};if(r.attestationObject)out.response.attestationObject=b64url(r.attestationObject);if(r.authenticatorData)out.response.authenticatorData=b64url(r.authenticatorData);if(r.signature)out.response.signature=b64url(r.signature);if(r.userHandle)out.response.userHandle=b64url(r.userHandle);if(r.getTransports)out.response.transports=r.getTransports();return out}
-if(!callbackUri||!state||!codeChallenge){form.hidden=true;status.textContent="This sign-in link is missing its secure desktop handoff. Return to the Void app and try again."}
+if(!state||!codeChallenge){form.hidden=true;status.textContent="This sign-in link is missing its secure desktop handoff. Return to the Void app and try again."}
 form.addEventListener("submit",async e=>{e.preventDefault();status.textContent="Waiting for your passkey…";form.querySelector("button").disabled=true;try{
-const start=await fetch("/api/accounts/signin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tag:document.getElementById("tag").value,callback_uri:callbackUri,state,code_challenge:codeChallenge})});
+const start=await fetch("/api/accounts/signin",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tag:document.getElementById("tag").value,state,code_challenge:codeChallenge})});
 if(!start.ok)throw new Error(await apiError(start,"Could not start sign-in."));const ceremony=await start.json(),publicKey=ceremony.options.publicKey;
 publicKey.challenge=fromB64url(publicKey.challenge);if(publicKey.allowCredentials)publicKey.allowCredentials=publicKey.allowCredentials.map(c=>({...c,id:fromB64url(c.id)}));
 const assertion=await navigator.credentials.get({publicKey});
@@ -475,8 +508,8 @@ mod tests {
     use crate::{auth::RejectAllAuthenticator, config::ServerConfig, state::AppState};
 
     use super::{
-        router, ACCOUNT_PORTAL_HTML, EMAIL_VERIFICATION_ERROR_HTML, SYSTEM_BROWSER_SIGNIN_HTML,
-        SYSTEM_BROWSER_SIGNUP_HTML,
+        router, ACCOUNT_PORTAL_HTML, ACCOUNT_SIGNIN_COMPLETE_HTML, EMAIL_VERIFICATION_ERROR_HTML,
+        SYSTEM_BROWSER_SIGNIN_HTML, SYSTEM_BROWSER_SIGNUP_HTML,
     };
 
     #[tokio::test]
@@ -547,9 +580,15 @@ mod tests {
         assert!(!ACCOUNT_PORTAL_HTML.contains("sessionStorage"));
         assert!(SYSTEM_BROWSER_SIGNIN_HTML.contains("navigator.credentials.get"));
         assert!(SYSTEM_BROWSER_SIGNIN_HTML.contains("code_challenge"));
+        assert!(SYSTEM_BROWSER_SIGNIN_HTML.contains("location.hash.slice(1)"));
+        assert!(SYSTEM_BROWSER_SIGNIN_HTML.contains("history.replaceState"));
+        assert!(!SYSTEM_BROWSER_SIGNIN_HTML.contains("callback_uri"));
+        assert!(!SYSTEM_BROWSER_SIGNIN_HTML.contains("127.0.0.1"));
         assert!(SYSTEM_BROWSER_SIGNUP_HTML.contains("navigator.credentials.create"));
         assert!(!SYSTEM_BROWSER_SIGNIN_HTML.contains("/api/accounts/session/exchange"));
         assert!(!SYSTEM_BROWSER_SIGNIN_HTML.contains("session_token"));
+        assert!(ACCOUNT_SIGNIN_COMPLETE_HTML.contains("Passkey verified"));
+        assert!(!ACCOUNT_SIGNIN_COMPLETE_HTML.contains("session_token"));
         assert!(ACCOUNT_PORTAL_HTML.contains("Create an account with a passkey"));
         assert!(ACCOUNT_PORTAL_HTML.contains("Sign in with a passkey"));
         assert!(!ACCOUNT_PORTAL_HTML.contains("verified=1"));
